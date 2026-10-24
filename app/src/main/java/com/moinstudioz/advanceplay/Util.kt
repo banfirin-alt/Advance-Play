@@ -1,0 +1,217 @@
+package com.moinstudioz.advanceplay
+
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.TrafficStats
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.os.ParcelFileDescriptor
+import android.os.Process
+import android.os.SystemClock
+import android.os.StatFs
+import android.os.storage.StorageManager
+import android.provider.DocumentsContract
+import androidx.documentfile.provider.DocumentFile
+import okhttp3.OkHttpClient
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.schabi.newpipe.extractor.NewPipe
+import org.schabi.newpipe.extractor.downloader.Downloader
+import org.schabi.newpipe.extractor.downloader.Request as NpRequest
+import org.schabi.newpipe.extractor.downloader.Response as NpResponse
+import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
+import org.schabi.newpipe.extractor.localization.Localization
+import java.io.File
+import java.io.IOException
+import java.util.concurrent.TimeUnit
+
+const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+
+object Http {
+    val client: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS).build()
+
+    /** Downloads use HTTP/1.1 so every segment gets its own TCP connection (real parallel speed). */
+    val dl: OkHttpClient = client.newBuilder()
+        .protocols(listOf(okhttp3.Protocol.HTTP_1_1))
+        .connectionPool(okhttp3.ConnectionPool(16, 2, TimeUnit.MINUTES))
+        .readTimeout(40, TimeUnit.SECONDS).build()
+}
+
+object Prefs {
+    private fun p(c: Context) = c.getSharedPreferences("ap", Context.MODE_PRIVATE)
+    fun tree(c: Context): Uri? = p(c).getString("tree", null)?.let { Uri.parse(it) }
+    fun setTree(c: Context, u: Uri?) = p(c).edit().putString("tree", u?.toString()).apply()
+    fun quality(c: Context) = p(c).getInt("q", 0)
+    fun setQuality(c: Context, q: Int) = p(c).edit().putInt("q", q).apply()
+    fun total(c: Context) = p(c).getLong("total", 0L)
+    fun addTotal(c: Context, d: Long) = p(c).edit().putLong("total", total(c) + d).apply()
+    fun resetTotal(c: Context) = p(c).edit().putLong("total", 0L).apply()
+    fun cap(c: Context) = p(c).getLong("cap", 0L)
+    fun setCap(c: Context, v: Long) = p(c).edit().putLong("cap", v).apply()
+    // survives app kill / reboot
+    fun pending(c: Context): Set<String> = p(c).getStringSet("pending", emptySet())!!.toSet()
+    fun addPending(c: Context, u: String) = p(c).edit().putStringSet("pending", pending(c) + u).apply()
+    fun removePending(c: Context, u: String) = p(c).edit().putStringSet("pending", pending(c) - u).apply()
+    fun lastUrl(c: Context): String? = p(c).getString("lastUrl", null)
+    fun setLastUrl(c: Context, u: String?) = p(c).edit().putString("lastUrl", u).apply()
+    fun lastDone(c: Context) = p(c).getString("lastDone", "") ?: ""
+    fun setLastDone(c: Context, t: String) = p(c).edit().putString("lastDone", t).apply()
+}
+
+/** Shared download state, read by the UI every second. */
+object DL {
+    @Volatile var active = false
+    @Volatile var title = ""
+    @Volatile var pct = 0
+    @Volatile var speed = 0L
+    @Volatile var queue = 0
+    @Volatile var doneSeq = 0
+    @Volatile var errSeq = 0
+    @Volatile var lastDone = ""
+    @Volatile var errMsg = ""
+    @Volatile var resumed = false
+    fun begin() { active = true; pct = 0; speed = 0 }
+    fun complete(t: String) { lastDone = t; doneSeq++; pct = 100 }
+    fun fail(m: String) { errMsg = m; errSeq++ }
+    fun idle() { active = false; speed = 0 }
+}
+
+/** Network usage of this app (browser + downloads). */
+object Net {
+    private var last = -1L
+    private var lastT = 0L
+    @Volatile var speed = 0L
+    @Volatile var session = 0L
+    @Volatile var supported = true
+    fun tick(c: Context) {
+        val rx = TrafficStats.getUidRxBytes(Process.myUid())
+        if (rx < 0) { supported = false; return }
+        val now = SystemClock.elapsedRealtime()
+        if (last >= 0) {
+            val d = (rx - last).coerceAtLeast(0)
+            val dt = (now - lastT).coerceAtLeast(1)
+            speed = d * 1000 / dt
+            session += d
+            if (d > 0) Prefs.addTotal(c, d)
+        }
+        last = rx; lastT = now
+    }
+}
+
+/**
+ * 80 / 20 split: while a video is playing in the browser, downloads are paced to 20% of the
+ * estimated link capacity, leaving the rest (80%) for the stream. Without a playing video,
+ * downloads run at full speed (and the link capacity estimate is learned from them).
+ */
+object Throttle {
+    @Volatile var streaming = false
+    const val DL_SHARE = 0.20
+    private var winStart = 0L
+    private var winBytes = 0L
+    private var was = false
+
+    fun capacity(c: Context): Long {
+        val learned = Prefs.cap(c)
+        if (learned > 0) return learned
+        return try {
+            val cm = c.getSystemService(ConnectivityManager::class.java)
+            val kbps = cm.getNetworkCapabilities(cm.activeNetwork)?.linkDownstreamBandwidthKbps ?: 0
+            if (kbps > 0) kbps * 125L else 2_000_000L
+        } catch (e: Exception) { 2_000_000L }
+    }
+
+    fun onBytes(c: Context, n: Int) {
+        var sleepMs = 0L
+        synchronized(this) {
+            val now = SystemClock.elapsedRealtime()
+            if (winStart == 0L || was != streaming) { winStart = now; winBytes = 0; was = streaming }
+            winBytes += n
+            val dt = now - winStart
+            if (!streaming) {
+                if (dt >= 1500) {
+                    val sp = winBytes * 1000 / dt
+                    val cap = Prefs.cap(c)
+                    Prefs.setCap(c, if (sp > cap) sp else cap - (cap - sp) / 20)
+                    winStart = now; winBytes = 0
+                }
+            } else {
+                val limit = (capacity(c) * DL_SHARE).toLong().coerceAtLeast(96_000L)
+                val needMs = winBytes * 1000 / limit
+                if (needMs > dt) sleepMs = minOf(needMs - dt, 1000L)
+                if (dt >= 2000) { winStart = now; winBytes = 0 }
+            }
+        }
+        if (sleepMs > 0) Thread.sleep(sleepMs)
+    }
+}
+
+object Usb {
+    class Out(val pfd: ParcelFileDescriptor, val delete: () -> Unit)
+
+    fun appDir(c: Context): File? =
+        c.getExternalFilesDirs(null).filterNotNull().firstOrNull { Environment.isExternalStorageRemovable(it) }
+
+    fun hasTarget(c: Context) = Prefs.tree(c) != null || appDir(c) != null
+
+    /** Pair(free, total) of the USB volume, or null if not connected. */
+    fun space(c: Context): Pair<Long, Long>? = try {
+        val tree = Prefs.tree(c)
+        val dir: File? = if (tree != null) {
+            val uuid = DocumentsContract.getTreeDocumentId(tree).substringBefore(':')
+            c.getExternalFilesDirs(null).filterNotNull().firstOrNull { it.path.contains("/$uuid/", true) }
+                ?: if (Build.VERSION.SDK_INT >= 30)
+                    c.getSystemService(StorageManager::class.java).storageVolumes
+                        .firstOrNull { it.uuid.equals(uuid, true) }?.directory
+                else null
+        } else appDir(c)
+        dir?.let { val s = StatFs(it.path); s.availableBytes to s.totalBytes }
+    } catch (e: Exception) { null }
+
+    fun open(c: Context, name: String, mime: String): Out {
+        val tree = Prefs.tree(c)
+        if (tree != null) {
+            val dir = DocumentFile.fromTreeUri(c, tree)
+            if (dir == null || !dir.exists() || !dir.canWrite())
+                throw IOException("USB folder not available. Plug in the USB or re-select the folder in Settings")
+            dir.findFile(name)?.delete()
+            val f = dir.createFile(mime, name) ?: throw IOException("Cannot create file on USB")
+            val pfd = c.contentResolver.openFileDescriptor(f.uri, "rw") ?: throw IOException("Cannot open file on USB")
+            return Out(pfd) { f.delete() }
+        }
+        val d = appDir(c) ?: throw IOException("No USB drive found. Select a USB folder in Settings")
+        val file = File(d, name)
+        val pfd = ParcelFileDescriptor.open(
+            file,
+            ParcelFileDescriptor.MODE_READ_WRITE or ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_TRUNCATE
+        )
+        return Out(pfd) { file.delete() }
+    }
+}
+
+class NpDownloader : Downloader() {
+    override fun execute(request: NpRequest): NpResponse {
+        val b = okhttp3.Request.Builder().url(request.url())
+        b.header("User-Agent", UA)
+        for ((k, vs) in request.headers()) { b.removeHeader(k); for (v in vs) b.addHeader(k, v) }
+        val data = request.dataToSend()
+        val m = request.httpMethod()
+        val body = when {
+            data != null -> data.toRequestBody()
+            m == "POST" -> ByteArray(0).toRequestBody()
+            else -> null
+        }
+        b.method(m, body)
+        Http.client.newCall(b.build()).execute().use { r ->
+            if (r.code == 429) throw ReCaptchaException("reCaptcha Challenge requested", request.url())
+            return NpResponse(r.code, r.message, r.headers.toMultimap(), r.body?.string(), r.request.url.toString())
+        }
+    }
+}
+
+object Np {
+    private var ok = false
+    @Synchronized fun init() {
+        if (!ok) { NewPipe.init(NpDownloader(), Localization("en", "US")); ok = true }
+    }
+}
