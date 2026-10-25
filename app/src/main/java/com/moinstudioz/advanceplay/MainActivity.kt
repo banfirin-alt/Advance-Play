@@ -155,7 +155,7 @@ class MainActivity : ComponentActivity() {
         resumeUnfinished()
         if (tv) toast("Hold BACK or press MENU for the Advance Play menu")
         h.post(tick); h.post(probe)
-        Thread { Backup.save(this) }.start()           // refresh the backup file on every start / reboot
+        Thread { Usb.autoSetup(this); UsbState.refresh(this, true); Backup.save(this) }.start()   // find USB again + refresh backup on every start
     }
 
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); handleIntent(intent) }
@@ -181,7 +181,7 @@ class MainActivity : ComponentActivity() {
     private fun resumeUnfinished() {
         if (DL.resumed) return
         DL.resumed = true
-        if (DL.queue > 0 || DL.active || !Usb.hasTarget(this)) return
+        if (DL.queue > 0 || DL.active || UsbState.err != null) return
         val p = Prefs.pending(this)
         if (p.isEmpty()) return
         toast("Resuming ${p.size} unfinished download(s)")
@@ -454,7 +454,7 @@ class MainActivity : ComponentActivity() {
 
     private fun enqueue(u: String) {
         val v = videoUrl(u) ?: run { toast("That is not a video link"); return }
-        Usb.check(this)?.let { toast(it); openSettings(); return }
+        UsbState.err?.let { toast(it); openSettings(); return }
         try {
             ContextCompat.startForegroundService(this, Intent(this, DownloadService::class.java).putExtra("url", v))
             toast("Added to download queue")
@@ -541,7 +541,8 @@ class MainActivity : ComponentActivity() {
             else st.append(if (tv) "Hold BACK or press MENU for the menu" else "Idle \u00B7 long-press a video to download")
             tStatus.text = st
             bar.progress = if (DL.active) DL.pct else 0
-            val u = Usb.space(this@MainActivity)
+            UsbState.refresh(this@MainActivity)
+            val u = UsbState.space
             val tag = if (tv) "USB" else "SD / Storage"
             tUsb.text = if (u == null) "$tag \u2022 not connected" else "$tag \u2022 ${fmt(u.first)} free"
             tNet.text = if (!Net.supported) "Network usage unavailable" else

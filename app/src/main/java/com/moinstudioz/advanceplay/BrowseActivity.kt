@@ -148,7 +148,7 @@ class BrowseActivity : ComponentActivity() {
 
     private fun download(v: StreamInfoItem) {
         val err = Dl.enqueue(this, v.url)
-        if (err != null) { toast(err); if (Usb.check(this) != null) startActivity(Intent(this, SettingsActivity::class.java)) }
+        if (err != null) { toast(err); if (UsbState.err != null) startActivity(Intent(this, SettingsActivity::class.java)) }
         else toast("Added to download queue")
     }
 
@@ -338,16 +338,18 @@ class BrowseActivity : ComponentActivity() {
             }
         })
         search(cats[0].second)
-        if (Usb.check(this) != null) toast("Open Settings and press Use USB drive")
         resumeUnfinished()
         h.post(tick)
-        Thread { Backup.save(this) }.start()
+        Thread {
+            Usb.autoSetup(this); UsbState.refresh(this, true); Backup.save(this)
+            if (Usb.check(this) != null) runOnUiThread { toast("Open Settings and press Use USB drive") }
+        }.start()
     }
 
     private fun resumeUnfinished() {
         if (DL.resumed) return
         DL.resumed = true
-        if (DL.queue > 0 || DL.active || !Usb.hasTarget(this)) return
+        if (DL.queue > 0 || DL.active || UsbState.err != null) return
         val p = Prefs.pending(this)
         if (p.isEmpty()) return
         toast("Resuming ${p.size} unfinished download(s)")
@@ -379,7 +381,8 @@ class BrowseActivity : ComponentActivity() {
                 if (limited) st.append(" \u00B7 limited to 20%")
             } else if (DL.lastDone.isNotEmpty()) st.append("\u2714 Saved: ").append(DL.lastDone.take(45))
             else st.append("Hold OK on a video to download it")
-            val u = Usb.space(this@BrowseActivity)
+            UsbState.refresh(this@BrowseActivity)
+            val u = UsbState.space
             st.append("   \u2022   ").append(if (tv) "USB " else "Storage ").append(if (u == null) "not connected" else fmt(u.first) + " free")
             tStatus.text = st
             tNet.text = if (!Net.supported) "Network usage unavailable" else

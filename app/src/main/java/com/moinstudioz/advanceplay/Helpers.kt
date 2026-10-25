@@ -46,7 +46,7 @@ object Dl {
     /** Returns an error message, or null when the download was queued. */
     fun enqueue(c: Context, u: String): String? {
         val v = canonical(u) ?: return "That is not a video link"
-        Usb.check(c)?.let { return it }
+        UsbState.err?.let { return it }
         return try {
             ContextCompat.startForegroundService(c, Intent(c, DownloadService::class.java).putExtra("url", v)); null
         } catch (e: Exception) { "Cannot start download: " + e.message }

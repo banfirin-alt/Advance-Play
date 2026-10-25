@@ -40,7 +40,7 @@ class DownloadService : Service() {
     private var wake: PowerManager.WakeLock? = null
     private var wifi: WifiManager.WifiLock? = null
     private var lastNotif = 0L
-    private val THREADS = 12                     // parallel connections = maximum internet
+    private val THREADS = 16                     // parallel connections = maximum internet
     private val SEG = 2L * 1024 * 1024
 
     override fun onBind(i: Intent?): IBinder? = null

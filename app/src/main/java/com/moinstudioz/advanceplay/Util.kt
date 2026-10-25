@@ -64,6 +64,10 @@ object Prefs {
     fun setDirect(c: Context, v: String?) = p(c).edit().putString("direct", v).apply()
     fun tvHome(c: Context) = p(c).getInt("tvhome", 0)             // 0 = fast native home, 1 = YouTube web
     fun setTvHome(c: Context, v: Int) = p(c).edit().putInt("tvhome", v).apply()
+    fun diag(c: Context): String = p(c).getString("diag", "") ?: ""
+    fun setDiag(c: Context, v: String) = p(c).edit().putString("diag", v).apply()
+    fun playHd(c: Context) = p(c).getBoolean("playhd", false)       // false = smooth streaming
+    fun setPlayHd(c: Context, v: Boolean) = p(c).edit().putBoolean("playhd", v).apply()
     fun maxSpeed(c: Context) = p(c).getBoolean("max", false)
     fun setMaxSpeed(c: Context, v: Boolean) = p(c).edit().putBoolean("max", v).apply()
     fun layout(c: Context) = p(c).getInt("layout", 0)          // 0 auto, 1 TV layout, 2 normal
@@ -178,13 +182,17 @@ object Usb {
     /** Where we save when no picker folder is set: the direct USB folder first, then the app's own USB/SD folder. */
     fun dir(c: Context): File? = Prefs.direct(c)?.let { File(it) } ?: appDir(c)
 
-    fun writable(d: File?): Boolean {
-        if (d == null) return false
+    /** null = we can write here, otherwise the reason it failed. */
+    fun tryWrite(d: File?): String? {
+        if (d == null) return "no folder"
         return try {
             d.mkdirs()
-            val f = File(d, ".ap_test"); f.writeText("x"); f.delete(); true
-        } catch (e: Exception) { false }
+            if (!d.isDirectory) return "cannot create folder"
+            val f = File(d, ".ap_test"); f.writeText("x"); f.delete(); null
+        } catch (e: Exception) { e.message ?: e.javaClass.simpleName }
     }
+
+    fun writable(d: File?) = tryWrite(d) == null
 
     private fun volDir(v: StorageVolume): File? = try {
         if (Build.VERSION.SDK_INT >= 30) v.directory
@@ -212,17 +220,49 @@ object Usb {
         return out.filter { it.exists() }
     }
 
-    /** "Use USB drive": finds the plugged-in drive and tests that we can write to it. No file picker needed. */
+    /** Every place on the USB drive we can try to save into (most visible first). */
+    fun candidates(c: Context): List<File> {
+        val roots = volumeRoots(c)
+        val out = ArrayList<File>()
+        roots.forEach { out.add(File(it, "AdvancePlay")) }
+        try {
+            @Suppress("DEPRECATION")
+            c.externalMediaDirs.filterNotNull().forEach {
+                val rem = try { Environment.isExternalStorageRemovable(it) } catch (e: Exception) { false }
+                if (rem) out.add(File(it, "AdvancePlay"))
+            }
+        } catch (_: Exception) {}
+        roots.forEach { out.add(File(it, "Android/media/${c.packageName}/AdvancePlay")) }
+        roots.forEach { out.add(File(it, "Android/data/${c.packageName}/files/AdvancePlay")) }
+        roots.forEach { out.add(File(it, "Download/AdvancePlay")); out.add(File(it, "Movies/AdvancePlay")) }
+        return out.distinct()
+    }
+
+    /** "Use USB drive": finds the plugged-in drive and the first folder on it we are allowed to write to. */
     fun setupDirect(c: Context): Setup {
         val roots = volumeRoots(c)
-        if (roots.isEmpty()) return Setup(false, "No USB drive found. Plug it in and try again.")
-        for (r in roots) {
-            val t = File(r, "AdvancePlay")
-            if (writable(t)) { Prefs.setDirect(c, t.path); Prefs.setTree(c, null); return Setup(true, t.path) }
+        if (roots.isEmpty()) {
+            Prefs.setDiag(c, "No USB drive found by the app.")
+            return Setup(false, "No USB drive found. Plug it in and try again.")
         }
+        val log = StringBuilder("Tried these places:\n")
+        for (d in candidates(c)) {
+            val e = tryWrite(d)
+            if (e == null) { Prefs.setDirect(c, d.path); Prefs.setTree(c, null); Prefs.setDiag(c, ""); return Setup(true, d.path) }
+            log.append(d.path.removePrefix("/storage/")).append("  ->  ").append(e.take(70)).append('\n')
+        }
+        Prefs.setDiag(c, log.toString())
         val needPerm = if (Build.VERSION.SDK_INT >= 30) !Environment.isExternalStorageManager()
         else ContextCompat.checkSelfPermission(c, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
-        return Setup(false, "The TV does not allow saving on this drive (${roots.first().path}). Try a drive formatted as exFAT or FAT32.", needPerm)
+        return Setup(false, "The TV would not let the app save on this USB drive. Details are shown on the screen.", needPerm)
+    }
+
+    /** Silent: on every start (and after a reinstall) find the USB folder again by itself and restore the backup. */
+    fun autoSetup(c: Context) {
+        if (Prefs.tree(c) != null) return
+        val cur = Prefs.direct(c)
+        if (cur != null && File(cur).isDirectory) return
+        if (setupDirect(c).ok) { Backup.restore(c); Backup.save(c) }
     }
 
     fun treeUuid(tree: Uri): String = DocumentsContract.getTreeDocumentId(tree).substringBefore(':')
@@ -388,5 +428,25 @@ object Backup {
             Throttle.maxSpeed = Prefs.maxSpeed(c)
             return true
         } catch (e: Exception) { return false }
+    }
+}
+
+/** Storage status for the screens, refreshed on a background thread so the TV never freezes on slow USB access. */
+object UsbState {
+    @Volatile var space: Pair<Long, Long>? = null
+    @Volatile var err: String? = null
+    private var busy = false
+    private var last = 0L
+    private val pool = java.util.concurrent.Executors.newSingleThreadExecutor()
+
+    @Synchronized fun refresh(c: Context, force: Boolean = false) {
+        val now = SystemClock.elapsedRealtime()
+        if (busy || (!force && now - last < 5000)) return
+        busy = true; last = now
+        val app = c.applicationContext
+        pool.execute {
+            try { err = Usb.check(app); space = Usb.space(app) } catch (_: Exception) {}
+            finally { busy = false }
+        }
     }
 }

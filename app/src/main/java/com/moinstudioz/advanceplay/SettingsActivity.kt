@@ -10,6 +10,8 @@ import android.graphics.drawable.StateListDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.Environment
 import android.provider.Settings
 import android.text.format.Formatter
@@ -37,6 +39,9 @@ class SettingsActivity : ComponentActivity() {
     private val lNames = arrayOf("Auto", "YouTube TV layout", "Normal YouTube")
     private lateinit var tTarget: TextView
     private lateinit var tInfo: TextView
+    private lateinit var tDiag: TextView
+    private lateinit var bPlay: TextView
+    private val h = Handler(Looper.getMainLooper())
     private lateinit var bUsb: TextView
     private lateinit var bPick: TextView
     private lateinit var bQ: TextView
@@ -73,13 +78,19 @@ class SettingsActivity : ComponentActivity() {
     }
 
     private fun useUsb() {
-        val s = Usb.setupDirect(this)
-        when {
-            s.ok -> afterTargetChosen("Saving to ${s.msg}")
-            s.needPerm -> requestStoragePermission(s.msg)
-            else -> toast(s.msg)
-        }
-        refresh()
+        toast("Checking the USB drive...")
+        Thread {
+            val s = Usb.setupDirect(this)
+            UsbState.refresh(this, true)
+            runOnUiThread {
+                when {
+                    s.ok -> afterTargetChosen("Saving to ${s.msg}")
+                    s.needPerm -> requestStoragePermission(s.msg)
+                    else -> toast(s.msg)
+                }
+                refresh()
+            }
+        }.start()
     }
 
     private fun requestStoragePermission(msg: String) {
@@ -123,13 +134,18 @@ class SettingsActivity : ComponentActivity() {
         add(tTarget)
         bUsb = pill(if (tv) "Use USB drive (recommended)" else "Use SD card / USB drive") { useUsb() }
         bPick = pill("Choose folder with file picker") {
-            try { pickTree.launch(null) } catch (e: ActivityNotFoundException) { toast("This device has no file picker. Use the USB drive button.") }
+            try { pickTree.launch(null) } catch (e: Exception) {
+                Prefs.setDiag(this, "This TV has no file picker (" + (e.message ?: e.javaClass.simpleName).take(60) + ").\nUse the 'Use USB drive' button instead.")
+                refresh()
+            }
         }
         bQ = pill("") { Prefs.setQuality(this, (Prefs.quality(this) + 1) % 3); refresh() }
         bSpeed = pill("") { Throttle.maxSpeed = !Throttle.maxSpeed; Prefs.setMaxSpeed(this, Throttle.maxSpeed); refresh() }
+        bPlay = pill("") { Prefs.setPlayHd(this, !Prefs.playHd(this)); refresh() }
         bHome = pill("") { Prefs.setTvHome(this, 1 - Prefs.tvHome(this)); refresh() }
         bLayout = pill("") { Prefs.setLayout(this, (Prefs.layout(this) + 1) % 3); refresh() }
-        add(bUsb); add(bPick); add(bQ); add(bSpeed)
+        tDiag = TextView(this).apply { setTextColor(Color.WHITE); textSize = 12f }
+        add(bUsb); add(tDiag); add(bPick); add(bQ); add(bPlay); add(bSpeed)
         if (tv) add(bHome)
         add(bLayout)
         tInfo = TextView(this).apply { setTextColor(RED); textSize = 14f }
@@ -145,7 +161,16 @@ class SettingsActivity : ComponentActivity() {
         bUsb.requestFocus()
     }
 
-    override fun onResume() { super.onResume(); refresh() }
+    private val poll = object : Runnable {
+        override fun run() {
+            UsbState.refresh(this@SettingsActivity)
+            tTarget.text = tTarget.text.toString().substringBefore("\n") + "\n" + (UsbState.err ?: "Ready to download")
+            h.postDelayed(this, 2000)
+        }
+    }
+
+    override fun onResume() { super.onResume(); refresh(); h.postDelayed(poll, 2000) }
+    override fun onPause() { super.onPause(); h.removeCallbacks(poll) }
 
     private fun refresh() {
         val tree = Prefs.tree(this)
@@ -154,8 +179,10 @@ class SettingsActivity : ComponentActivity() {
             Prefs.direct(this) != null -> "USB: " + Prefs.direct(this)
             else -> "Not set yet"
         }
-        val err = Usb.check(this)
-        tTarget.text = "Saving to: $where" + (if (err != null) "\n$err" else "\nReady to download")
+        UsbState.refresh(this, true)
+        tTarget.text = "Saving to: $where\n" + (UsbState.err ?: "Ready to download")
+        tDiag.text = Prefs.diag(this)
+        bPlay.text = "Streaming quality: " + (if (Prefs.playHd(this)) "HD (may buffer)" else "Smooth (recommended)")
         bQ.text = "Download quality: " + qNames[Prefs.quality(this)]
         bSpeed.text = "Download speed: " + (if (Throttle.maxSpeed) "MAXIMUM always" else "Maximum, but 80/20 while a video plays")
         bHome.text = "TV home screen: " + (if (Prefs.tvHome(this) == 0) "Fast native (recommended)" else "YouTube web page")

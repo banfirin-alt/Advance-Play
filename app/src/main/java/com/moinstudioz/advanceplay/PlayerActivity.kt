@@ -22,6 +22,7 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.MergingMediaSource
@@ -70,6 +71,12 @@ class PlayerActivity : ComponentActivity() {
         })
         if (yt != null) {
             overlay.addView(TextView(this).apply {
+                text = "Hold OK or press MENU to download"; setTextColor(0xFFCCCCCC.toInt()); textSize = 13f
+                setShadowLayer(6f, 0f, 0f, Color.BLACK)
+            }, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(dp(24), dp(52), 0, 0)
+            })
+            overlay.addView(TextView(this).apply {
                 text = "\u2B07 Download"; setTextColor(Color.WHITE); textSize = 15f; typeface = Typeface.DEFAULT_BOLD
                 setPadding(dp(18), dp(10), dp(18), dp(10)); isFocusable = true; isClickable = true
                 background = GradientDrawable().apply { cornerRadius = dp(24).toFloat(); setColor(0xCC161616.toInt()); setStroke(dp(1), 0xFF555555.toInt()) }
@@ -94,7 +101,9 @@ class PlayerActivity : ComponentActivity() {
         }
         view.setControllerVisibilityListener(PlayerView.ControllerVisibilityListener { v -> overlay.visibility = if (v == View.VISIBLE) View.VISIBLE else View.GONE })
 
-        val p = ExoPlayer.Builder(this).build()
+        val p = ExoPlayer.Builder(this)
+            .setLoadControl(DefaultLoadControl.Builder().setBufferDurationsMs(30_000, 120_000, 1_500, 4_000).build())
+            .build()
         view.player = p
         player = p
         p.addListener(object : Player.Listener {
@@ -139,7 +148,7 @@ class PlayerActivity : ComponentActivity() {
                     when {
                         live && info.hlsUrl.isNotEmpty() ->
                             p.setMediaSource(HlsMediaSource.Factory(dsf).createMediaSource(MediaItem.fromUri(info.hlsUrl)))
-                        vOnly != null && aud != null && (prog == null || vOnly.height > prog.height) ->
+                        vOnly != null && aud != null && (prog == null || (Prefs.playHd(this) && vOnly.height > prog.height)) ->
                             p.setMediaSource(MergingMediaSource(
                                 pf.createMediaSource(MediaItem.fromUri(vOnly.content)),
                                 pf.createMediaSource(MediaItem.fromUri(aud.content))))
@@ -152,8 +161,18 @@ class PlayerActivity : ComponentActivity() {
         }.start()
     }
 
+    private var okHeld = false
+
     override fun dispatchKeyEvent(e: KeyEvent): Boolean {
-        if (yt != null && e.keyCode == KeyEvent.KEYCODE_PROG_BLUE && e.action == KeyEvent.ACTION_UP) { download(); return true }
+        val k = e.keyCode
+        if (yt != null) {
+            if ((k == KeyEvent.KEYCODE_PROG_BLUE || k == KeyEvent.KEYCODE_MENU) && e.action == KeyEvent.ACTION_UP) { download(); return true }
+            if (k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER) {
+                if (e.action == KeyEvent.ACTION_DOWN && e.repeatCount == 1) { okHeld = true; download(); return true }
+                if (e.action == KeyEvent.ACTION_DOWN && okHeld) return true
+                if (e.action == KeyEvent.ACTION_UP && okHeld) { okHeld = false; return true }
+            }
+        }
         return super.dispatchKeyEvent(e)
     }
 
