@@ -27,8 +27,12 @@ dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.activity:activity-ktx:1.9.3")
     implementation("androidx.documentfile:documentfile:1.0.1")
+    implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    // YouTube extractor. If YouTube changes and downloads stop, bump this tag to the newest release.
-    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.24.8")
+    // YouTube extractor. v0.24.x is broken by YouTube ("page needs to be reloaded"); 0.26.5 is the fixed one.
+    // If downloads stop later, bump this tag to the newest release.
+    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.26.5")
+    implementation("androidx.media3:media3-exoplayer:1.5.1")
+    implementation("androidx.media3:media3-ui:1.5.1")
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
 }

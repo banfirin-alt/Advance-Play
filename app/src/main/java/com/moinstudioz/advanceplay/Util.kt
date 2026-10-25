@@ -1,6 +1,9 @@
 package com.moinstudioz.advanceplay
 
+import android.app.UiModeManager
 import android.content.Context
+import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.ConnectivityManager
 import android.net.TrafficStats
 import android.net.Uri
@@ -21,6 +24,7 @@ import org.schabi.newpipe.extractor.downloader.Request as NpRequest
 import org.schabi.newpipe.extractor.downloader.Response as NpResponse
 import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
 import org.schabi.newpipe.extractor.localization.Localization
+import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
@@ -34,7 +38,7 @@ object Http {
     /** Downloads use HTTP/1.1 so every segment gets its own TCP connection (real parallel speed). */
     val dl: OkHttpClient = client.newBuilder()
         .protocols(listOf(okhttp3.Protocol.HTTP_1_1))
-        .connectionPool(okhttp3.ConnectionPool(16, 2, TimeUnit.MINUTES))
+        .connectionPool(okhttp3.ConnectionPool(32, 2, TimeUnit.MINUTES))
         .readTimeout(40, TimeUnit.SECONDS).build()
 }
 
@@ -53,6 +57,15 @@ object Prefs {
     fun pending(c: Context): Set<String> = p(c).getStringSet("pending", emptySet())!!.toSet()
     fun addPending(c: Context, u: String) = p(c).edit().putStringSet("pending", pending(c) + u).apply()
     fun removePending(c: Context, u: String) = p(c).edit().putStringSet("pending", pending(c) - u).apply()
+    fun maxSpeed(c: Context) = p(c).getBoolean("max", false)
+    fun setMaxSpeed(c: Context, v: Boolean) = p(c).edit().putBoolean("max", v).apply()
+    fun layout(c: Context) = p(c).getInt("layout", 0)          // 0 auto, 1 TV layout, 2 normal
+    fun setLayout(c: Context, v: Int) = p(c).edit().putInt("layout", v).apply()
+    fun setTotal(c: Context, v: Long) = p(c).edit().putLong("total", v).apply()
+    fun bkTs(c: Context) = p(c).getLong("bkts", 0L)
+    fun setBkTs(c: Context, v: Long) = p(c).edit().putLong("bkts", v).apply()
+    fun pos(c: Context, k: String) = p(c).getLong("pos_" + k.hashCode(), 0L)
+    fun setPos(c: Context, k: String, v: Long) = p(c).edit().putLong("pos_" + k.hashCode(), v).apply()
     fun lastUrl(c: Context): String? = p(c).getString("lastUrl", null)
     fun setLastUrl(c: Context, u: String?) = p(c).edit().putString("lastUrl", u).apply()
     fun lastDone(c: Context) = p(c).getString("lastDone", "") ?: ""
@@ -106,6 +119,7 @@ object Net {
  */
 object Throttle {
     @Volatile var streaming = false
+    @Volatile var maxSpeed = false      // true = never limit downloads
     const val DL_SHARE = 0.20
     private var winStart = 0L
     private var winBytes = 0L
@@ -125,10 +139,11 @@ object Throttle {
         var sleepMs = 0L
         synchronized(this) {
             val now = SystemClock.elapsedRealtime()
-            if (winStart == 0L || was != streaming) { winStart = now; winBytes = 0; was = streaming }
+            val limited = streaming && !maxSpeed
+            if (winStart == 0L || was != limited) { winStart = now; winBytes = 0; was = limited }
             winBytes += n
             val dt = now - winStart
-            if (!streaming) {
+            if (!limited) {
                 if (dt >= 1500) {
                     val sp = winBytes * 1000 / dt
                     val cap = Prefs.cap(c)
@@ -152,7 +167,24 @@ object Usb {
     fun appDir(c: Context): File? =
         c.getExternalFilesDirs(null).filterNotNull().firstOrNull { Environment.isExternalStorageRemovable(it) }
 
-    fun hasTarget(c: Context) = Prefs.tree(c) != null || appDir(c) != null
+    fun treeUuid(tree: Uri): String = DocumentsContract.getTreeDocumentId(tree).substringBefore(':')
+
+    /** null = OK, otherwise a message telling the user what to fix. TV must use USB, never internal memory. */
+    fun check(c: Context): String? {
+        val tree = Prefs.tree(c)
+        if (tree != null) {
+            if (Dev.isTv(c) && treeUuid(tree).equals("primary", true))
+                return "On TV choose a folder on the USB drive, not the TV memory"
+            return null
+        }
+        if (appDir(c) != null) return null
+        return if (Dev.isTv(c)) "Plug in a USB drive, then choose a folder in Settings"
+        else "Insert an SD card or choose a download folder in Settings"
+    }
+
+    fun hasTarget(c: Context) = check(c) == null
+
+    fun tempDir(c: Context): File = appDir(c) ?: c.cacheDir
 
     /** Pair(free, total) of the USB volume, or null if not connected. */
     fun space(c: Context): Pair<Long, Long>? = try {
@@ -169,6 +201,7 @@ object Usb {
     } catch (e: Exception) { null }
 
     fun open(c: Context, name: String, mime: String): Out {
+        check(c)?.let { throw IOException(it) }
         val tree = Prefs.tree(c)
         if (tree != null) {
             val dir = DocumentFile.fromTreeUri(c, tree)
@@ -213,5 +246,89 @@ object Np {
     private var ok = false
     @Synchronized fun init() {
         if (!ok) { NewPipe.init(NpDownloader(), Localization("en", "US")); ok = true }
+    }
+}
+
+object Dev {
+    fun isTv(c: Context): Boolean {
+        val m = c.getSystemService(UiModeManager::class.java)
+        return m?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION ||
+            !c.packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)
+    }
+}
+
+object Library {
+    class Item(val name: String, val uri: Uri, val size: Long, val modified: Long)
+    private val exts = setOf("mp4", "m4a", "mkv", "webm")
+    private fun ok(n: String?) = n != null && n.substringAfterLast('.', "").lowercase() in exts
+
+    fun list(c: Context): List<Item> {
+        val tree = Prefs.tree(c)
+        val out = ArrayList<Item>()
+        if (tree != null) {
+            DocumentFile.fromTreeUri(c, tree)?.listFiles()?.forEach {
+                if (it.isFile && ok(it.name)) out.add(Item(it.name!!, it.uri, it.length(), it.lastModified()))
+            }
+        } else {
+            Usb.appDir(c)?.listFiles()?.forEach {
+                if (it.isFile && ok(it.name)) out.add(Item(it.name, Uri.fromFile(it), it.length(), it.lastModified()))
+            }
+        }
+        return out.sortedByDescending { it.modified }
+    }
+}
+
+/** Backup file kept next to the videos (USB / SD card). Survives uninstall + reinstall. */
+object Backup {
+    private const val NAME = "AdvancePlay-backup.json"
+
+    @Synchronized fun save(c: Context): Boolean {
+        try {
+            val ts = System.currentTimeMillis()
+            val txt = JSONObject().apply {
+                put("total", Prefs.total(c)); put("cap", Prefs.cap(c)); put("quality", Prefs.quality(c))
+                put("max", Prefs.maxSpeed(c)); put("layout", Prefs.layout(c)); put("lastDone", Prefs.lastDone(c))
+                put("updated", ts)
+            }.toString()
+            val tree = Prefs.tree(c)
+            if (tree != null) {
+                val dir = DocumentFile.fromTreeUri(c, tree) ?: return false
+                if (!dir.canWrite()) return false
+                val f = dir.findFile(NAME) ?: dir.createFile("application/json", NAME) ?: return false
+                c.contentResolver.openOutputStream(f.uri, "wt")?.use { it.write(txt.toByteArray()) } ?: return false
+            } else {
+                val d = Usb.appDir(c) ?: return false
+                File(d, NAME).writeText(txt)
+            }
+            Prefs.setBkTs(c, ts)
+            return true
+        } catch (e: Exception) { return false }
+    }
+
+    /** Returns true when data was restored from an existing backup. */
+    @Synchronized fun restore(c: Context): Boolean {
+        try {
+            val tree = Prefs.tree(c)
+            val txt: String = if (tree != null) {
+                val f = DocumentFile.fromTreeUri(c, tree)?.findFile(NAME) ?: return false
+                c.contentResolver.openInputStream(f.uri)?.use { String(it.readBytes()) } ?: return false
+            } else {
+                val f = File(Usb.appDir(c) ?: return false, NAME)
+                if (!f.exists()) return false
+                f.readText()
+            }
+            val j = JSONObject(txt)
+            val ts = j.optLong("updated", 0)
+            if (ts <= Prefs.bkTs(c)) return false
+            Prefs.setTotal(c, maxOf(Prefs.total(c), j.optLong("total", 0)))
+            if (j.optLong("cap", 0) > Prefs.cap(c)) Prefs.setCap(c, j.optLong("cap"))
+            Prefs.setQuality(c, j.optInt("quality", 0))
+            Prefs.setMaxSpeed(c, j.optBoolean("max", false))
+            Prefs.setLayout(c, j.optInt("layout", 0))
+            if (Prefs.lastDone(c).isEmpty()) Prefs.setLastDone(c, j.optString("lastDone", ""))
+            Prefs.setBkTs(c, ts)
+            Throttle.maxSpeed = Prefs.maxSpeed(c)
+            return true
+        } catch (e: Exception) { return false }
     }
 }

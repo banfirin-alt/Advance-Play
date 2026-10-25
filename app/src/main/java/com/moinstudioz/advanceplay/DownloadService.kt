@@ -28,7 +28,7 @@ import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
-import java.util.concurrent.ExecutionException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -40,13 +40,14 @@ class DownloadService : Service() {
     private var wake: PowerManager.WakeLock? = null
     private var wifi: WifiManager.WifiLock? = null
     private var lastNotif = 0L
-    private val THREADS = 6                      // parallel connections = maximum internet
-    private val SEG = 4L * 1024 * 1024
+    private val THREADS = 12                     // parallel connections = maximum internet
+    private val SEG = 2L * 1024 * 1024
 
     override fun onBind(i: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
+        Throttle.maxSpeed = Prefs.maxSpeed(this)
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel("dl", "Downloads", NotificationManager.IMPORTANCE_LOW))
         nm.createNotificationChannel(NotificationChannel("done", "Download results", NotificationManager.IMPORTANCE_DEFAULT))
@@ -116,6 +117,7 @@ class DownloadService : Service() {
         }
         DL.complete(info.name)
         Prefs.setLastDone(this, info.name)
+        runCatching { Backup.save(this) }
         notifyDone("Download complete", info.name)
     }
 
@@ -132,7 +134,7 @@ class DownloadService : Service() {
     }
 
     private fun saveHd(vUrl: String, aUrl: String, name: String) {
-        val vf = File(cacheDir, "v.tmp"); val af = File(cacheDir, "a.tmp")
+        val td = Usb.tempDir(this); val vf = File(td, "ap_v.tmp"); val af = File(td, "ap_a.tmp")
         try {
             RandomAccessFile(vf, "rw").use { fetchTo(vUrl, it.channel, 0, 45) }
             RandomAccessFile(af, "rw").use { fetchTo(aUrl, it.channel, 45, 55) }
@@ -154,26 +156,50 @@ class DownloadService : Service() {
         }
     }
 
-    /** Parallel segmented download: THREADS connections, each pulls 4 MB segments until the file is complete. */
+    /**
+     * Maximum-speed download: THREADS parallel connections fetch 2 MB segments into memory,
+     * and one writer thread stores them to the USB strictly in order (fast, flash-friendly writes).
+     */
     private fun fetchTo(url: String, ch: FileChannel, from: Int, to: Int) {
         val total = probeSize(url)
-        val next = AtomicLong(0)
+        val nSeg = ((total + SEG - 1) / SEG).toInt()
+        val next = AtomicInteger(0)
+        val written = AtomicInteger(0)
+        val ready = ConcurrentHashMap<Int, ByteArray>()
         val done = AtomicLong(0)
         val failure = AtomicReference<Throwable?>(null)
-        val pool = Executors.newFixedThreadPool(THREADS)
+        val window = THREADS + 4
+        val pool = Executors.newFixedThreadPool(THREADS + 1)
         try {
-            val tasks = (1..THREADS).map {
-                pool.submit {
+            val tasks = ArrayList<java.util.concurrent.Future<*>>()
+            repeat(THREADS) {
+                tasks += pool.submit(Runnable {
                     try {
-                        val buf = ByteArray(128 * 1024)
                         while (failure.get() == null) {
-                            val start = next.getAndAdd(SEG)
-                            if (start >= total) break
-                            segment(url, start, minOf(start + SEG, total) - 1, ch, buf) { done.addAndGet(it.toLong()) }
+                            val i = next.getAndIncrement()
+                            if (i >= nSeg) break
+                            while (i - written.get() >= window && failure.get() == null) Thread.sleep(15)
+                            val start = i * SEG
+                            val end = minOf(start + SEG, total) - 1
+                            val data = ByteArray((end - start + 1).toInt())
+                            segment(url, start, end, data) { n -> done.addAndGet(n.toLong()) }
+                            ready[i] = data
                         }
-                    } catch (t: Throwable) { failure.compareAndSet(null, t); throw t }
-                }
+                    } catch (t: Throwable) { failure.compareAndSet(null, t) }
+                })
             }
+            tasks += pool.submit(Runnable {
+                try {
+                    var w = 0
+                    while (w < nSeg && failure.get() == null) {
+                        val d = ready.remove(w)
+                        if (d == null) { Thread.sleep(8); continue }
+                        val bb = ByteBuffer.wrap(d)
+                        while (bb.hasRemaining()) ch.write(bb)
+                        w++; written.set(w)
+                    }
+                } catch (t: Throwable) { failure.compareAndSet(null, t) }
+            })
             var lastB = 0L
             var lastT = SystemClock.elapsedRealtime()
             while (tasks.any { !it.isDone }) {
@@ -182,35 +208,36 @@ class DownloadService : Service() {
                 val d = done.get()
                 DL.speed = (d - lastB) * 1000 / (now - lastT).coerceAtLeast(1)
                 lastB = d; lastT = now
-                DL.pct = (from + (to - from) * d / total).toInt()
+                DL.pct = (from + (to - from) * d / total).toInt().coerceAtMost(to)
                 tickNotif()
             }
-            try { tasks.forEach { it.get() } } catch (e: ExecutionException) { throw (e.cause as? Exception) ?: e }
+            failure.get()?.let { throw (it as? Exception) ?: IOException(it.message) }
             DL.pct = to
         } finally { pool.shutdownNow() }
     }
 
-    private fun segment(url: String, start: Long, end: Long, ch: FileChannel, buf: ByteArray, onBytes: (Int) -> Unit) {
-        var pos = start
+    private fun segment(url: String, start: Long, end: Long, data: ByteArray, onBytes: (Int) -> Unit) {
+        var got = 0
         var tries = 0
-        while (pos <= end) {
+        while (got < data.size) {
             try {
-                val req = okhttp3.Request.Builder().url(url).header("User-Agent", UA).header("Range", "bytes=$pos-$end").build()
+                val req = okhttp3.Request.Builder().url(url).header("User-Agent", UA)
+                    .header("Range", "bytes=${start + got}-$end").build()
                 Http.dl.newCall(req).execute().use { r ->
                     if (r.code != 206) throw IOException("Server error ${r.code}")
                     val ins = (r.body ?: throw IOException("Empty response")).byteStream()
-                    while (pos <= end) {
-                        val n = ins.read(buf, 0, minOf(buf.size.toLong(), end - pos + 1).toInt())
+                    while (got < data.size) {
+                        val n = ins.read(data, got, data.size - got)
                         if (n < 0) break
-                        ch.write(ByteBuffer.wrap(buf, 0, n), pos)
-                        pos += n; onBytes(n)
-                        Throttle.onBytes(this, n)          // 80/20 split while a video is playing
+                        got += n
+                        onBytes(n)
+                        Throttle.onBytes(this, n)          // 80/20 split only while a video plays (unless Max speed)
                     }
                 }
-                if (pos <= end) throw IOException("Connection dropped")
+                if (got < data.size) throw IOException("Connection dropped")
             } catch (e: IOException) {
-                if (++tries >= 5) throw e
-                Thread.sleep(400L * tries)
+                if (++tries >= 6) throw e
+                Thread.sleep(300L * tries)
             }
         }
     }
