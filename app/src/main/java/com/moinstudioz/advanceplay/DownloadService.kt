@@ -274,7 +274,7 @@ class DownloadService : Service() {
     }
 
     private fun pi() = PendingIntent.getActivity(
-        this, 0, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK),
+        this, 0, Intent(this, if (Dev.isTv(this)) BrowseActivity::class.java else MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK),
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
     )
 

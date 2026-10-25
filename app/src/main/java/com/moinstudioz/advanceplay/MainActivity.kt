@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.text.format.Formatter
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
@@ -78,6 +79,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var sLayout: TextView
     private lateinit var sInfo: TextView
     private var rail: LinearLayout? = null
+    private var panelView: View? = null
+    private var menuUntil = 0L
     private var custom: View? = null
     private var customCb: WebChromeClient.CustomViewCallback? = null
     private lateinit var mobUa: String
@@ -159,12 +162,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
+        if (!::web.isInitialized) return
         CookieManager.getInstance().flush()
         val u = web.url
         if (u != null && u.contains("youtube.com") && !u.contains("watch") && !u.contains("shorts")) Prefs.setLastUrl(this, u)
     }
 
-    override fun onDestroy() { h.removeCallbacksAndMessages(null); web.destroy(); super.onDestroy() }
+    override fun onDestroy() { h.removeCallbacksAndMessages(null); if (::web.isInitialized) web.destroy(); super.onDestroy() }
 
     private fun handleIntent(i: Intent?) {
         if (i?.action == Intent.ACTION_SEND) {
@@ -268,7 +272,7 @@ class MainActivity : ComponentActivity() {
             settings.domStorageEnabled = true
             settings.mediaPlaybackRequiresUserGesture = false
             settings.useWideViewPort = true
-            if (Build.VERSION.SDK_INT >= 33) settings.isAlgorithmicDarkeningAllowed = true
+            if (Build.VERSION.SDK_INT >= 33 && !tv) settings.isAlgorithmicDarkeningAllowed = true
             mobUa = settings.userAgentString.replace("; wv", "").replace(Regex("Version/\\d+\\.\\d+ "), "")
             webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
@@ -318,6 +322,7 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(12), dp(16), dp(10))
             background = shape(0xFF111111.toInt(), 0xFF2A2A2A.toInt(), 1, 24)
         }
+        panelView = panel
         panel.addView(tStatus); panel.addView(bar, MATCH, dp(5))
         if (tv) panel.addView(tUsb)
         panel.addView(tNet); panel.addView(wm, MATCH, WRAP)
@@ -423,7 +428,7 @@ class MainActivity : ComponentActivity() {
     }
 
     // ---------- settings ----------
-    private fun openSettings() { refreshSettings(); settings.visibility = View.VISIBLE; sUsb.requestFocus() }
+    private fun openSettings() { startActivity(Intent(this, SettingsActivity::class.java)) }
 
     private fun refreshSettings() {
         val name = Prefs.tree(this)?.let { DocumentFile.fromTreeUri(this, it)?.name }
@@ -477,7 +482,12 @@ class MainActivity : ComponentActivity() {
     }
 
     // ---------- TV remote ----------
-    private fun openMenu() { if (tv) rail?.getChildAt(0)?.requestFocus() else openSettings() }
+    private fun openMenu() {
+        if (!tv) { openSettings(); return }
+        menuUntil = SystemClock.elapsedRealtime() + 10000
+        rail?.visibility = View.VISIBLE; panelView?.visibility = View.VISIBLE
+        rail?.getChildAt(0)?.requestFocus()
+    }
     private fun toggleMenu() { if (rail?.hasFocus() == true) web.requestFocus() else openMenu() }
 
     override fun dispatchKeyEvent(e: KeyEvent): Boolean {
@@ -539,7 +549,11 @@ class MainActivity : ComponentActivity() {
                     (if (limited) "\nStreaming video 80% \u00B7 Downloads 20%" else "")
             if (DL.doneSeq != seenDone) { seenDone = DL.doneSeq; showCard("\u2714 Download Complete", DL.lastDone + "\nSaved to " + (if (tv) "USB" else "your SD card / folder"), false) }
             if (DL.errSeq != seenErr) { seenErr = DL.errSeq; showCard("Download failed", DL.errMsg, true) }
-            if (settings.visibility == View.VISIBLE) refreshInfo()
+            if (tv) {   // while a video is playing, hide the menu so the video uses the whole screen
+                val watching = web.url?.contains("watch") == true
+                val vis = if (!watching || SystemClock.elapsedRealtime() < menuUntil || rail?.hasFocus() == true) View.VISIBLE else View.GONE
+                if (rail?.visibility != vis) { rail?.visibility = vis; panelView?.visibility = vis }
+            }
             if (++ticks % 600 == 0) Thread { Backup.save(this@MainActivity) }.start()
             h.postDelayed(this, 1000)
         }

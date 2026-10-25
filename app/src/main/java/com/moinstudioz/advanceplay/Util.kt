@@ -1,5 +1,6 @@
 package com.moinstudioz.advanceplay
 
+import android.Manifest
 import android.app.UiModeManager
 import android.content.Context
 import android.content.pm.PackageManager
@@ -14,6 +15,8 @@ import android.os.Process
 import android.os.SystemClock
 import android.os.StatFs
 import android.os.storage.StorageManager
+import android.os.storage.StorageVolume
+import androidx.core.content.ContextCompat
 import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
 import okhttp3.OkHttpClient
@@ -57,6 +60,10 @@ object Prefs {
     fun pending(c: Context): Set<String> = p(c).getStringSet("pending", emptySet())!!.toSet()
     fun addPending(c: Context, u: String) = p(c).edit().putStringSet("pending", pending(c) + u).apply()
     fun removePending(c: Context, u: String) = p(c).edit().putStringSet("pending", pending(c) - u).apply()
+    fun direct(c: Context): String? = p(c).getString("direct", null)
+    fun setDirect(c: Context, v: String?) = p(c).edit().putString("direct", v).apply()
+    fun tvHome(c: Context) = p(c).getInt("tvhome", 0)             // 0 = fast native home, 1 = YouTube web
+    fun setTvHome(c: Context, v: Int) = p(c).edit().putInt("tvhome", v).apply()
     fun maxSpeed(c: Context) = p(c).getBoolean("max", false)
     fun setMaxSpeed(c: Context, v: Boolean) = p(c).edit().putBoolean("max", v).apply()
     fun layout(c: Context) = p(c).getInt("layout", 0)          // 0 auto, 1 TV layout, 2 normal
@@ -163,9 +170,60 @@ object Throttle {
 
 object Usb {
     class Out(val pfd: ParcelFileDescriptor, val delete: () -> Unit)
+    class Setup(val ok: Boolean, val msg: String, val needPerm: Boolean = false)
 
     fun appDir(c: Context): File? =
         c.getExternalFilesDirs(null).filterNotNull().firstOrNull { Environment.isExternalStorageRemovable(it) }
+
+    /** Where we save when no picker folder is set: the direct USB folder first, then the app's own USB/SD folder. */
+    fun dir(c: Context): File? = Prefs.direct(c)?.let { File(it) } ?: appDir(c)
+
+    fun writable(d: File?): Boolean {
+        if (d == null) return false
+        return try {
+            d.mkdirs()
+            val f = File(d, ".ap_test"); f.writeText("x"); f.delete(); true
+        } catch (e: Exception) { false }
+    }
+
+    private fun volDir(v: StorageVolume): File? = try {
+        if (Build.VERSION.SDK_INT >= 30) v.directory
+        else (StorageVolume::class.java.getMethod("getPath").invoke(v) as? String)?.let { File(it) }
+    } catch (e: Exception) { null }
+
+    /** USB drives / SD cards currently plugged in. */
+    fun volumeRoots(c: Context): List<File> {
+        val out = LinkedHashSet<File>()
+        try {
+            c.getSystemService(StorageManager::class.java).storageVolumes.forEach { v ->
+                if (v.isRemovable && v.state == Environment.MEDIA_MOUNTED) volDir(v)?.let { out.add(it) }
+            }
+        } catch (_: Exception) {}
+        try {
+            c.getExternalFilesDirs(null).filterNotNull().forEach {
+                if (Environment.isExternalStorageRemovable(it)) out.add(File(it.path.substringBefore("/Android/data")))
+            }
+        } catch (_: Exception) {}
+        try {
+            File("/storage").listFiles()?.forEach {
+                if (it.isDirectory && it.name != "emulated" && it.name != "self" && it.canRead()) out.add(it)
+            }
+        } catch (_: Exception) {}
+        return out.filter { it.exists() }
+    }
+
+    /** "Use USB drive": finds the plugged-in drive and tests that we can write to it. No file picker needed. */
+    fun setupDirect(c: Context): Setup {
+        val roots = volumeRoots(c)
+        if (roots.isEmpty()) return Setup(false, "No USB drive found. Plug it in and try again.")
+        for (r in roots) {
+            val t = File(r, "AdvancePlay")
+            if (writable(t)) { Prefs.setDirect(c, t.path); Prefs.setTree(c, null); return Setup(true, t.path) }
+        }
+        val needPerm = if (Build.VERSION.SDK_INT >= 30) !Environment.isExternalStorageManager()
+        else ContextCompat.checkSelfPermission(c, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+        return Setup(false, "The TV does not allow saving on this drive (${roots.first().path}). Try a drive formatted as exFAT or FAT32.", needPerm)
+    }
 
     fun treeUuid(tree: Uri): String = DocumentsContract.getTreeDocumentId(tree).substringBefore(':')
 
@@ -177,27 +235,27 @@ object Usb {
                 return "On TV choose a folder on the USB drive, not the TV memory"
             return null
         }
-        if (appDir(c) != null) return null
-        return if (Dev.isTv(c)) "Plug in a USB drive, then choose a folder in Settings"
+        val d = dir(c) ?: return if (Dev.isTv(c)) "No USB drive found. Plug it in, then open Settings and press Use USB drive"
         else "Insert an SD card or choose a download folder in Settings"
+        return if (writable(d)) null else "Cannot save to the USB yet. Open Settings and press Use USB drive"
     }
 
     fun hasTarget(c: Context) = check(c) == null
 
-    fun tempDir(c: Context): File = appDir(c) ?: c.cacheDir
+    fun tempDir(c: Context): File = dir(c)?.takeIf { writable(it) } ?: c.cacheDir
 
     /** Pair(free, total) of the USB volume, or null if not connected. */
     fun space(c: Context): Pair<Long, Long>? = try {
         val tree = Prefs.tree(c)
-        val dir: File? = if (tree != null) {
-            val uuid = DocumentsContract.getTreeDocumentId(tree).substringBefore(':')
+        val d: File? = if (tree != null) {
+            val uuid = treeUuid(tree)
             c.getExternalFilesDirs(null).filterNotNull().firstOrNull { it.path.contains("/$uuid/", true) }
                 ?: if (Build.VERSION.SDK_INT >= 30)
                     c.getSystemService(StorageManager::class.java).storageVolumes
                         .firstOrNull { it.uuid.equals(uuid, true) }?.directory
                 else null
-        } else appDir(c)
-        dir?.let { val s = StatFs(it.path); s.availableBytes to s.totalBytes }
+        } else dir(c)
+        d?.let { val s = StatFs(it.path); s.availableBytes to s.totalBytes }
     } catch (e: Exception) { null }
 
     fun open(c: Context, name: String, mime: String): Out {
@@ -212,7 +270,7 @@ object Usb {
             val pfd = c.contentResolver.openFileDescriptor(f.uri, "rw") ?: throw IOException("Cannot open file on USB")
             return Out(pfd) { f.delete() }
         }
-        val d = appDir(c) ?: throw IOException("No USB drive found. Select a USB folder in Settings")
+        val d = dir(c) ?: throw IOException("No USB drive found. Open Settings and press Use USB drive")
         val file = File(d, name)
         val pfd = ParcelFileDescriptor.open(
             file,
@@ -270,7 +328,7 @@ object Library {
                 if (it.isFile && ok(it.name)) out.add(Item(it.name!!, it.uri, it.length(), it.lastModified()))
             }
         } else {
-            Usb.appDir(c)?.listFiles()?.forEach {
+            Usb.dir(c)?.listFiles()?.forEach {
                 if (it.isFile && ok(it.name)) out.add(Item(it.name, Uri.fromFile(it), it.length(), it.lastModified()))
             }
         }
@@ -297,7 +355,7 @@ object Backup {
                 val f = dir.findFile(NAME) ?: dir.createFile("application/json", NAME) ?: return false
                 c.contentResolver.openOutputStream(f.uri, "wt")?.use { it.write(txt.toByteArray()) } ?: return false
             } else {
-                val d = Usb.appDir(c) ?: return false
+                val d = Usb.dir(c) ?: return false
                 File(d, NAME).writeText(txt)
             }
             Prefs.setBkTs(c, ts)
@@ -313,7 +371,7 @@ object Backup {
                 val f = DocumentFile.fromTreeUri(c, tree)?.findFile(NAME) ?: return false
                 c.contentResolver.openInputStream(f.uri)?.use { String(it.readBytes()) } ?: return false
             } else {
-                val f = File(Usb.appDir(c) ?: return false, NAME)
+                val f = File(Usb.dir(c) ?: return false, NAME)
                 if (!f.exists()) return false
                 f.readText()
             }

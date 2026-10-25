@@ -6,6 +6,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29"/>
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
     <uses-feature android:name="android.hardware.touchscreen" android:required="false"/>
     <uses-feature android:name="android.software.leanback" android:required="false"/>
 
@@ -15,7 +18,21 @@
         android:banner="@drawable/banner"
         android:theme="@style/AppTheme"
         android:largeHeap="true"
+        android:requestLegacyExternalStorage="true"
         android:supportsRtl="true">
+
+        <!-- TV home: fast native YouTube browser -->
+        <activity
+            android:name=".BrowseActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>
+            </intent-filter>
+        </activity>
+
+        <!-- Phone home + YouTube web (sign-in) -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -24,7 +41,6 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
-                <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.SEND"/>
@@ -32,6 +48,9 @@
                 <data android:mimeType="text/plain"/>
             </intent-filter>
         </activity>
+
+        <activity android:name=".SettingsActivity" android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode"/>
         <activity android:name=".LibraryActivity" android:exported="false"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode"/>
         <activity android:name=".PlayerActivity" android:exported="false" android:screenOrientation="sensorLandscape"
