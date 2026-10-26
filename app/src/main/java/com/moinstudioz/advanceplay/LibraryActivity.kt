@@ -133,6 +133,7 @@ class LibraryActivity : ComponentActivity() {
                 Thread {
                     try {
                         if (it.uri.scheme == "file") File(it.uri.path!!).delete()
+                        else if (it.uri.authority == "media") contentResolver.delete(it.uri, null, null)
                         else DocumentsContract.deleteDocument(contentResolver, it.uri)
                     } catch (_: Exception) {}
                     runOnUiThread { reload() }

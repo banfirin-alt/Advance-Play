@@ -16,6 +16,9 @@ import android.os.SystemClock
 import android.os.StatFs
 import android.os.storage.StorageManager
 import android.os.storage.StorageVolume
+import android.content.ContentUris
+import android.content.ContentValues
+import android.provider.MediaStore
 import androidx.core.content.ContextCompat
 import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
@@ -60,6 +63,9 @@ object Prefs {
     fun pending(c: Context): Set<String> = p(c).getStringSet("pending", emptySet())!!.toSet()
     fun addPending(c: Context, u: String) = p(c).edit().putStringSet("pending", pending(c) + u).apply()
     fun removePending(c: Context, u: String) = p(c).edit().putStringSet("pending", pending(c) - u).apply()
+    /** Name of a USB volume that we save to through Android's media database (MediaStore). */
+    fun ms(c: Context): String? = p(c).getString("msvol", null)
+    fun setMs(c: Context, v: String?) = p(c).edit().putString("msvol", v).apply()
     fun direct(c: Context): String? = p(c).getString("direct", null)
     fun setDirect(c: Context, v: String?) = p(c).edit().putString("direct", v).apply()
     fun tvHome(c: Context) = p(c).getInt("tvhome", 0)             // 0 = fast native home, 1 = YouTube web
@@ -173,14 +179,15 @@ object Throttle {
 }
 
 object Usb {
-    class Out(val pfd: ParcelFileDescriptor, val delete: () -> Unit)
+    class Out(val pfd: ParcelFileDescriptor, val delete: () -> Unit, val finish: () -> Unit = {})
     class Setup(val ok: Boolean, val msg: String, val needPerm: Boolean = false)
 
     fun appDir(c: Context): File? =
         c.getExternalFilesDirs(null).filterNotNull().firstOrNull { Environment.isExternalStorageRemovable(it) }
 
     /** Where we save when no picker folder is set: the direct USB folder first, then the app's own USB/SD folder. */
-    fun dir(c: Context): File? = Prefs.direct(c)?.let { File(it) } ?: appDir(c)
+    fun dir(c: Context): File? =
+        if (Prefs.ms(c) != null) null else Prefs.direct(c)?.let { File(it) } ?: appDir(c)
 
     /** null = we can write here, otherwise the reason it failed. */
     fun tryWrite(d: File?): String? {
@@ -238,19 +245,127 @@ object Usb {
         return out.distinct()
     }
 
+    // ---------------------------------------------------------------------------------------
+    // MediaStore mode: used when the TV blocks plain file access to the USB drive (EPERM).
+    // Files are created through Android's own media database, which knows the USB volume.
+    // They land in  <USB>/Download/AdvancePlay/
+    // ---------------------------------------------------------------------------------------
+    private const val MS_REL = "Download/AdvancePlay/"
+
+    /** Names of plugged-in USB / SD volumes known to the media database (empty before Android 10). */
+    fun msVolumes(c: Context): List<String> {
+        if (Build.VERSION.SDK_INT < 29) return emptyList()
+        return try {
+            MediaStore.getExternalVolumeNames(c)
+                .filter { it != MediaStore.VOLUME_EXTERNAL_PRIMARY && it != MediaStore.VOLUME_EXTERNAL }
+        } catch (e: Exception) { emptyList() }
+    }
+
+    private fun msBase(vol: String): Uri = MediaStore.Downloads.getContentUri(vol)
+
+    private fun msFind(c: Context, vol: String, name: String): Uri? {
+        if (Build.VERSION.SDK_INT < 29) return null
+        return try {
+            c.contentResolver.query(
+                msBase(vol), arrayOf(MediaStore.MediaColumns._ID),
+                MediaStore.MediaColumns.DISPLAY_NAME + "=? AND " + MediaStore.MediaColumns.RELATIVE_PATH + "=?",
+                arrayOf(name, MS_REL), null
+            )?.use { q -> if (q.moveToFirst()) ContentUris.withAppendedId(msBase(vol), q.getLong(0)) else null }
+        } catch (e: Exception) { null }
+    }
+
+    /** Creates a new empty file on the USB through the media database and opens it for writing. */
+    private fun msOpen(c: Context, vol: String, name: String, mime: String, overwrite: Boolean = true): Out {
+        if (Build.VERSION.SDK_INT < 29) throw IOException("This Android version cannot use the media database")
+        val cr = c.contentResolver
+        if (overwrite) msFind(c, vol, name)?.let { try { cr.delete(it, null, null) } catch (_: Exception) {} }
+        val cv = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, mime)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, MS_REL.trimEnd('/'))
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = cr.insert(msBase(vol), cv) ?: throw IOException("The TV would not create a file on the USB")
+        var opened: ParcelFileDescriptor? = null
+        try { opened = cr.openFileDescriptor(uri, "rw") } catch (_: Exception) {}
+        val pfd = opened
+        if (pfd == null) {
+            try { cr.delete(uri, null, null) } catch (_: Exception) {}
+            throw IOException("Cannot open file on USB")
+        }
+        return Out(pfd, { try { cr.delete(uri, null, null) } catch (_: Exception) {} }, {
+            try {
+                cr.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            } catch (_: Exception) {}
+        })
+    }
+
+    /** null = this USB volume works, otherwise the reason it did not. */
+    private fun msTry(c: Context, vol: String): String? = try {
+        val o = msOpen(c, vol, "ap_test.txt", "text/plain")
+        try { ParcelFileDescriptor.AutoCloseOutputStream(o.pfd).use { it.write(1) } }
+        finally { o.delete() }
+        null
+    } catch (e: Exception) { e.message ?: e.javaClass.simpleName }
+
+    fun openBackup(c: Context, name: String): Out = msOpen(c, Prefs.ms(c) ?: throw IOException("no USB"), name, "application/json")
+
+    fun readBackup(c: Context, name: String): String? {
+        val vol = Prefs.ms(c) ?: return null
+        val u = msFind(c, vol, name) ?: return null
+        return try { c.contentResolver.openInputStream(u)?.use { String(it.readBytes()) } } catch (e: Exception) { null }
+    }
+
+    /** Videos already saved in MediaStore mode (for the Library screen). */
+    fun msList(c: Context, vol: String, exts: Set<String>): List<Library.Item> {
+        val out = ArrayList<Library.Item>()
+        if (Build.VERSION.SDK_INT < 29) return out
+        try {
+            c.contentResolver.query(
+                msBase(vol),
+                arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.SIZE, MediaStore.MediaColumns.DATE_MODIFIED),
+                MediaStore.MediaColumns.RELATIVE_PATH + "=?", arrayOf(MS_REL), null
+            )?.use { q ->
+                while (q.moveToNext()) {
+                    val n = q.getString(1) ?: continue
+                    if (n.substringAfterLast('.', "").lowercase() !in exts) continue
+                    out.add(Library.Item(n, ContentUris.withAppendedId(msBase(vol), q.getLong(0)), q.getLong(2), q.getLong(3) * 1000))
+                }
+            }
+        } catch (_: Exception) {}
+        return out
+    }
+
+    private fun msVolumeDir(c: Context, vol: String): File? = try {
+        if (Build.VERSION.SDK_INT >= 30)
+            c.getSystemService(StorageManager::class.java).storageVolumes
+                .firstOrNull { it.uuid.equals(vol, true) }?.directory
+        else null
+    } catch (e: Exception) { null }
+
     /** "Use USB drive": finds the plugged-in drive and the first folder on it we are allowed to write to. */
     fun setupDirect(c: Context): Setup {
         val roots = volumeRoots(c)
-        if (roots.isEmpty()) {
+        if (roots.isEmpty() && msVolumes(c).isEmpty()) {
             Prefs.setDiag(c, "No USB drive found by the app.")
             return Setup(false, "No USB drive found. Plug it in and try again.")
         }
         val log = StringBuilder("Tried these places:\n")
         for (d in candidates(c)) {
             val e = tryWrite(d)
-            if (e == null) { Prefs.setDirect(c, d.path); Prefs.setTree(c, null); Prefs.setDiag(c, ""); return Setup(true, d.path) }
+            if (e == null) { Prefs.setDirect(c, d.path); Prefs.setMs(c, null); Prefs.setTree(c, null); Prefs.setDiag(c, ""); return Setup(true, d.path) }
             log.append(d.path.removePrefix("/storage/")).append("  ->  ").append(e.take(70)).append('\n')
         }
+        // Plain file access is blocked (EPERM on many TVs). Try the media database instead.
+        for (vol in msVolumes(c)) {
+            val e = msTry(c, vol)
+            if (e == null) {
+                Prefs.setMs(c, vol); Prefs.setDirect(c, null); Prefs.setTree(c, null); Prefs.setDiag(c, "")
+                return Setup(true, "USB drive ($vol) in folder " + MS_REL.trimEnd('/'))
+            }
+            log.append("media database ").append(vol).append("  ->  ").append(e.take(70)).append('\n')
+        }
+        if (msVolumes(c).isEmpty()) log.append("media database: no USB volume found\n")
         Prefs.setDiag(c, log.toString())
         val needPerm = if (Build.VERSION.SDK_INT >= 30) !Environment.isExternalStorageManager()
         else ContextCompat.checkSelfPermission(c, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
@@ -260,8 +375,10 @@ object Usb {
     /** Silent: on every start (and after a reinstall) find the USB folder again by itself and restore the backup. */
     fun autoSetup(c: Context) {
         if (Prefs.tree(c) != null) return
+        val ms = Prefs.ms(c)
+        if (ms != null && ms in msVolumes(c)) return
         val cur = Prefs.direct(c)
-        if (cur != null && File(cur).isDirectory) return
+        if (ms == null && cur != null && File(cur).isDirectory) return
         if (setupDirect(c).ok) { Backup.restore(c); Backup.save(c) }
     }
 
@@ -275,6 +392,8 @@ object Usb {
                 return "On TV choose a folder on the USB drive, not the TV memory"
             return null
         }
+        val ms = Prefs.ms(c)
+        if (ms != null) return if (ms in msVolumes(c)) null else "USB drive not found. Plug it in, then open Settings and press Use USB drive"
         val d = dir(c) ?: return if (Dev.isTv(c)) "No USB drive found. Plug it in, then open Settings and press Use USB drive"
         else "Insert an SD card or choose a download folder in Settings"
         return if (writable(d)) null else "Cannot save to the USB yet. Open Settings and press Use USB drive"
@@ -294,7 +413,8 @@ object Usb {
                     c.getSystemService(StorageManager::class.java).storageVolumes
                         .firstOrNull { it.uuid.equals(uuid, true) }?.directory
                 else null
-        } else dir(c)
+        } else if (Prefs.ms(c) != null) msVolumeDir(c, Prefs.ms(c)!!)
+        else dir(c)
         d?.let { val s = StatFs(it.path); s.availableBytes to s.totalBytes }
     } catch (e: Exception) { null }
 
@@ -310,6 +430,7 @@ object Usb {
             val pfd = c.contentResolver.openFileDescriptor(f.uri, "rw") ?: throw IOException("Cannot open file on USB")
             return Out(pfd) { f.delete() }
         }
+        Prefs.ms(c)?.let { return msOpen(c, it, name, mime) }
         val d = dir(c) ?: throw IOException("No USB drive found. Open Settings and press Use USB drive")
         val file = File(d, name)
         val pfd = ParcelFileDescriptor.open(
@@ -367,6 +488,8 @@ object Library {
             DocumentFile.fromTreeUri(c, tree)?.listFiles()?.forEach {
                 if (it.isFile && ok(it.name)) out.add(Item(it.name!!, it.uri, it.length(), it.lastModified()))
             }
+        } else if (Prefs.ms(c) != null) {
+            out.addAll(Usb.msList(c, Prefs.ms(c)!!, exts))
         } else {
             Usb.dir(c)?.listFiles()?.forEach {
                 if (it.isFile && ok(it.name)) out.add(Item(it.name, Uri.fromFile(it), it.length(), it.lastModified()))
@@ -394,6 +517,10 @@ object Backup {
                 if (!dir.canWrite()) return false
                 val f = dir.findFile(NAME) ?: dir.createFile("application/json", NAME) ?: return false
                 c.contentResolver.openOutputStream(f.uri, "wt")?.use { it.write(txt.toByteArray()) } ?: return false
+            } else if (Prefs.ms(c) != null) {
+                val o = Usb.openBackup(c, NAME)
+                ParcelFileDescriptor.AutoCloseOutputStream(o.pfd).use { it.write(txt.toByteArray()) }
+                o.finish()
             } else {
                 val d = Usb.dir(c) ?: return false
                 File(d, NAME).writeText(txt)
@@ -410,6 +537,8 @@ object Backup {
             val txt: String = if (tree != null) {
                 val f = DocumentFile.fromTreeUri(c, tree)?.findFile(NAME) ?: return false
                 c.contentResolver.openInputStream(f.uri)?.use { String(it.readBytes()) } ?: return false
+            } else if (Prefs.ms(c) != null) {
+                Usb.readBackup(c, NAME) ?: return false
             } else {
                 val f = File(Usb.dir(c) ?: return false, NAME)
                 if (!f.exists()) return false

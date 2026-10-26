@@ -176,6 +176,7 @@ class SettingsActivity : ComponentActivity() {
         val tree = Prefs.tree(this)
         val where = when {
             tree != null -> "Folder: " + (DocumentFile.fromTreeUri(this, tree)?.name ?: tree.toString())
+            Prefs.ms(this) != null -> "USB drive, folder Download/AdvancePlay"
             Prefs.direct(this) != null -> "USB: " + Prefs.direct(this)
             else -> "Not set yet"
         }
