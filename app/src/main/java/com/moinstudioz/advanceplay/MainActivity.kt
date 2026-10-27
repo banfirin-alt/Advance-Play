@@ -364,7 +364,8 @@ class MainActivity : ComponentActivity() {
         full(txt(26f, RED).apply { text = "Settings"; typeface = Typeface.DEFAULT_BOLD })
         sUsb = pill("", RED, RED) {
             try { pickTree.launch(null) } catch (e: ActivityNotFoundException) {
-                toast("No folder picker on this device. The USB/SD app folder will be used instead.")
+                toast(if (Prefs.media(this) != null) "No folder picker on this device. Saving to the USB drive instead."
+                      else "No folder picker on this device. The USB/SD app folder will be used instead.")
             }
         }
         sQ = pill("", RED, RED) { Prefs.setQuality(this, (Prefs.quality(this) + 1) % 3); refreshSettings() }
@@ -432,7 +433,8 @@ class MainActivity : ComponentActivity() {
 
     private fun refreshSettings() {
         val name = Prefs.tree(this)?.let { DocumentFile.fromTreeUri(this, it)?.name }
-        sUsb.text = (if (tv) "USB folder: " else "Download folder (SD card): ") + (name ?: "tap to choose")
+        val usbMode = Prefs.media(this)?.let { "USB drive (MediaStore: $it)" }   // saving through MediaStore, no folder chosen
+        sUsb.text = (if (tv) "USB folder: " else "Download folder (SD card): ") + (name ?: usbMode ?: "tap to choose")
         sQ.text = "Download quality: " + qNames[Prefs.quality(this)]
         sSpeed.text = "Download speed: " + (if (Throttle.maxSpeed) "MAXIMUM always" else "Maximum, but 80/20 while a video plays")
         sLayout.text = "YouTube layout: " + lNames[Prefs.layout(this)]
@@ -548,7 +550,7 @@ class MainActivity : ComponentActivity() {
             tNet.text = if (!Net.supported) "Network usage unavailable" else
                 "Network \u2193 ${spd(Net.speed)} \u00B7 Session ${fmt(Net.session)} \u00B7 Total ${fmt(Prefs.total(this@MainActivity))}" +
                     (if (limited) "\nStreaming video 80% \u00B7 Downloads 20%" else "")
-            if (DL.doneSeq != seenDone) { seenDone = DL.doneSeq; showCard("\u2714 Download Complete", DL.lastDone + "\nSaved to " + (if (tv) "USB" else "your SD card / folder"), false) }
+            if (DL.doneSeq != seenDone) { seenDone = DL.doneSeq; showCard("\u2714 Download Complete", DL.lastDone + "\nSaved to " + (if (tv || Prefs.media(this@MainActivity) != null) "USB" else "your SD card / folder"), false) }
             if (DL.errSeq != seenErr) { seenErr = DL.errSeq; showCard("Download failed", DL.errMsg, true) }
             if (tv) {   // while a video is playing, hide the menu so the video uses the whole screen
                 val watching = web.url?.contains("watch") == true

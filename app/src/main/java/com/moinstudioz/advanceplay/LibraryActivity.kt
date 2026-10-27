@@ -20,6 +20,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -127,16 +128,30 @@ class LibraryActivity : ComponentActivity() {
         }.start()
     }
 
-    private fun confirmDelete(it: Library.Item) {
-        AlertDialog.Builder(this).setTitle("Delete this video?").setMessage(it.name)
+    private fun confirmDelete(v: Library.Item) {
+        AlertDialog.Builder(this).setTitle("Delete this video?").setMessage(v.name)
             .setPositiveButton("Delete") { _, _ ->
                 Thread {
+                    val media = Prefs.media(this) != null      // USB drive (MediaStore) mode
+                    var problem: String? = null
                     try {
-                        if (it.uri.scheme == "file") File(it.uri.path!!).delete()
-                        else if (it.uri.authority == "media") contentResolver.delete(it.uri, null, null)
-                        else DocumentsContract.deleteDocument(contentResolver, it.uri)
-                    } catch (_: Exception) {}
-                    runOnUiThread { reload() }
+                        if (v.uri.scheme == "file") File(v.uri.path!!).delete()
+                        else if (media) {
+                            // MediaStore mode: delete the row, Android deletes the file on the USB too
+                            if (contentResolver.delete(v.uri, null, null) <= 0) problem = "Could not delete this video"
+                        }
+                        else DocumentsContract.deleteDocument(contentResolver, v.uri)
+                    } catch (e: SecurityException) {
+                        // includes RecoverableSecurityException: Android did not allow us to delete a file we did not create
+                        if (media) problem = "Android did not allow deleting this video"
+                    } catch (e: Exception) {
+                        if (media) problem = "Could not delete: " + (e.message ?: e.javaClass.simpleName).take(80)
+                    }
+                    val msg: String? = problem
+                    runOnUiThread {
+                        if (msg != null) Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                        reload()
+                    }
                 }.start()
             }.setNegativeButton("Cancel", null).show()
     }

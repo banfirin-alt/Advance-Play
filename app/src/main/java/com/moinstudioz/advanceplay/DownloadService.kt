@@ -128,7 +128,7 @@ class DownloadService : Service() {
                 fetchTo(url, ch, 0, 100)
                 runCatching { ch.force(false) }
             }
-            out.finish()
+            out.finish()    // success: in USB (MediaStore) mode this makes the video visible; other modes do nothing
         } catch (e: Exception) {
             runCatching { out.pfd.close() }; out.delete(); throw e
         }
@@ -143,7 +143,7 @@ class DownloadService : Service() {
             try {
                 mux(vf, af, out.pfd, 55, 100)
                 out.pfd.close()
-                out.finish()
+                out.finish()    // success: in USB (MediaStore) mode this makes the video visible; other modes do nothing
             } catch (e: Exception) {
                 runCatching { out.pfd.close() }; out.delete(); throw e
             }
