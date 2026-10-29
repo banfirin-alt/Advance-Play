@@ -90,6 +90,7 @@ class MainActivity : ComponentActivity() {
     private var backHeld = false
     private var ticks = 0
     private val h = Handler(Looper.getMainLooper())
+    private var splash: SplashView? = null          // the Moin Studioz intro video that covers the screen at start
 
     private val pickTree = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
@@ -250,6 +251,7 @@ class MainActivity : ComponentActivity() {
         item(R.drawable.ic_home, "Home", Color.WHITE) { web.loadUrl(home()) }
         item(R.drawable.ic_library, "Library", Color.WHITE) { startActivity(Intent(this, LibraryActivity::class.java)) }
         item(R.drawable.ic_download, "Download", Color.WHITE) { downloadCurrent() }
+        item(R.drawable.ic_apps, "Apps", Color.WHITE) { WebSites.showMenu(this, false) }
         item(R.drawable.ic_moon, "Background", Color.WHITE) { enterBlack() }
         item(R.drawable.ic_settings, "Settings", RED) { openSettings() }
         return n
@@ -281,6 +283,7 @@ class MainActivity : ComponentActivity() {
                 override fun onPageFinished(v: WebView, url: String?) {
                     errRetry = 0; swipe.isRefreshing = false
                     CookieManager.getInstance().flush()
+                    splash?.contentReady()          // first page is there: the intro may fade out once its video has finished
                 }
                 override fun onReceivedError(v: WebView, r: WebResourceRequest, e: WebResourceError) {
                     if (!r.isForMainFrame) return
@@ -364,7 +367,8 @@ class MainActivity : ComponentActivity() {
         full(txt(26f, RED).apply { text = "Settings"; typeface = Typeface.DEFAULT_BOLD })
         sUsb = pill("", RED, RED) {
             try { pickTree.launch(null) } catch (e: ActivityNotFoundException) {
-                toast("No folder picker on this device. The USB/SD app folder will be used instead.")
+                toast(if (Prefs.media(this) != null) "No folder picker on this device. Saving to the USB drive instead."
+                      else "No folder picker on this device. The USB/SD app folder will be used instead.")
             }
         }
         sQ = pill("", RED, RED) { Prefs.setQuality(this, (Prefs.quality(this) + 1) % 3); refreshSettings() }
@@ -405,6 +409,11 @@ class MainActivity : ComponentActivity() {
             setOnLongClickListener { exitBlack(); true }
         }
         root.addView(black, MATCH, MATCH)
+
+        // Moin Studioz intro video: plays once when the app starts, on top of everything
+        splash = Splash.create(this)
+        splash?.let { root.addView(it, MATCH, MATCH) }
+        h.postDelayed({ splash?.contentReady() }, 15000)      // if the page is very slow, do not keep the intro waiting
     }
 
     // ---------- background mode ----------
@@ -432,7 +441,8 @@ class MainActivity : ComponentActivity() {
 
     private fun refreshSettings() {
         val name = Prefs.tree(this)?.let { DocumentFile.fromTreeUri(this, it)?.name }
-        sUsb.text = (if (tv) "USB folder: " else "Download folder (SD card): ") + (name ?: "tap to choose")
+        val usbMode = Prefs.media(this)?.let { "USB drive (MediaStore: $it)" }   // saving through MediaStore, no folder chosen
+        sUsb.text = (if (tv) "USB folder: " else "Download folder (SD card): ") + (name ?: usbMode ?: "tap to choose")
         sQ.text = "Download quality: " + qNames[Prefs.quality(this)]
         sSpeed.text = "Download speed: " + (if (Throttle.maxSpeed) "MAXIMUM always" else "Maximum, but 80/20 while a video plays")
         sLayout.text = "YouTube layout: " + lNames[Prefs.layout(this)]
@@ -491,6 +501,7 @@ class MainActivity : ComponentActivity() {
     private fun toggleMenu() { if (rail?.hasFocus() == true) web.requestFocus() else openMenu() }
 
     override fun dispatchKeyEvent(e: KeyEvent): Boolean {
+        if (Splash.blocks(splash, e)) return true          // the intro video plays to the end
         val k = e.keyCode
         val down = e.action == KeyEvent.ACTION_DOWN
         if (black.visibility == View.VISIBLE) {
@@ -548,7 +559,7 @@ class MainActivity : ComponentActivity() {
             tNet.text = if (!Net.supported) "Network usage unavailable" else
                 "Network \u2193 ${spd(Net.speed)} \u00B7 Session ${fmt(Net.session)} \u00B7 Total ${fmt(Prefs.total(this@MainActivity))}" +
                     (if (limited) "\nStreaming video 80% \u00B7 Downloads 20%" else "")
-            if (DL.doneSeq != seenDone) { seenDone = DL.doneSeq; showCard("\u2714 Download Complete", DL.lastDone + "\nSaved to " + (if (tv) "USB" else "your SD card / folder"), false) }
+            if (DL.doneSeq != seenDone) { seenDone = DL.doneSeq; showCard("\u2714 Download Complete", DL.lastDone + "\nSaved to " + (if (tv || Prefs.media(this@MainActivity) != null) "USB" else "your SD card / folder"), false) }
             if (DL.errSeq != seenErr) { seenErr = DL.errSeq; showCard("Download failed", DL.errMsg, true) }
             if (tv) {   // while a video is playing, hide the menu so the video uses the whole screen
                 val watching = web.url?.contains("watch") == true

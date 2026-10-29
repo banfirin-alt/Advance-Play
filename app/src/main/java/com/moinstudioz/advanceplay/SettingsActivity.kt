@@ -100,7 +100,7 @@ class SettingsActivity : ComponentActivity() {
                 toast("Switch ON 'Allow access to all files' for Advance Play, go back, then press Use USB drive again.")
             } catch (e: Exception) {
                 try { startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) }
-                catch (e2: Exception) { toast(msg + " This TV has no permission screen. Try the file-picker button, or another USB drive.") }
+                catch (e2: Exception) { toast(msg) }
             }
         } else askStorage.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
     }
@@ -176,7 +176,7 @@ class SettingsActivity : ComponentActivity() {
         val tree = Prefs.tree(this)
         val where = when {
             tree != null -> "Folder: " + (DocumentFile.fromTreeUri(this, tree)?.name ?: tree.toString())
-            Prefs.ms(this) != null -> "USB drive, folder Download/AdvancePlay"
+            Prefs.media(this) != null -> "USB drive (MediaStore: " + Prefs.media(this) + ")"
             Prefs.direct(this) != null -> "USB: " + Prefs.direct(this)
             else -> "Not set yet"
         }
