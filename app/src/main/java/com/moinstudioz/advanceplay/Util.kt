@@ -2,13 +2,19 @@ package com.moinstudioz.advanceplay
 
 import android.Manifest
 import android.app.UiModeManager
+import android.content.ContentResolver
+import android.content.ContentUris
+import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.database.Cursor
+import android.media.MediaScannerConnection
 import android.net.ConnectivityManager
 import android.net.TrafficStats
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.os.Process
@@ -16,11 +22,9 @@ import android.os.SystemClock
 import android.os.StatFs
 import android.os.storage.StorageManager
 import android.os.storage.StorageVolume
-import android.content.ContentUris
-import android.content.ContentValues
-import android.provider.MediaStore
 import androidx.core.content.ContextCompat
 import android.provider.DocumentsContract
+import android.provider.MediaStore
 import androidx.documentfile.provider.DocumentFile
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -51,7 +55,12 @@ object Http {
 object Prefs {
     private fun p(c: Context) = c.getSharedPreferences("ap", Context.MODE_PRIVATE)
     fun tree(c: Context): Uri? = p(c).getString("tree", null)?.let { Uri.parse(it) }
-    fun setTree(c: Context, u: Uri?) = p(c).edit().putString("tree", u?.toString()).apply()
+    /** Choosing a picker folder (non-null) switches off the other two modes. */
+    fun setTree(c: Context, u: Uri?) {
+        val e = p(c).edit().putString("tree", u?.toString())
+        if (u != null) e.remove("media")
+        e.apply()
+    }
     fun quality(c: Context) = p(c).getInt("q", 0)
     fun setQuality(c: Context, q: Int) = p(c).edit().putInt("q", q).apply()
     fun total(c: Context) = p(c).getLong("total", 0L)
@@ -63,11 +72,21 @@ object Prefs {
     fun pending(c: Context): Set<String> = p(c).getStringSet("pending", emptySet())!!.toSet()
     fun addPending(c: Context, u: String) = p(c).edit().putStringSet("pending", pending(c) + u).apply()
     fun removePending(c: Context, u: String) = p(c).edit().putStringSet("pending", pending(c) - u).apply()
-    /** Name of a USB volume that we save to through Android's media database (MediaStore). */
-    fun ms(c: Context): String? = p(c).getString("msvol", null)
-    fun setMs(c: Context, v: String?) = p(c).edit().putString("msvol", v).apply()
     fun direct(c: Context): String? = p(c).getString("direct", null)
-    fun setDirect(c: Context, v: String?) = p(c).edit().putString("direct", v).apply()
+    /** Choosing a direct folder path (non-null) switches off MediaStore mode. */
+    fun setDirect(c: Context, v: String?) {
+        val e = p(c).edit().putString("direct", v)
+        if (v != null) e.remove("media")
+        e.apply()
+    }
+    /** MediaStore volume name of the USB drive (for example "7245-1da0"), or null when MediaStore mode is not used. */
+    fun media(c: Context): String? = p(c).getString("media", null)
+    /** Choosing MediaStore mode (non-null) switches off the direct path and the picker folder. */
+    fun setMedia(c: Context, v: String?) {
+        val e = p(c).edit().putString("media", v)
+        if (v != null) e.remove("direct").remove("tree")
+        e.apply()
+    }
     fun tvHome(c: Context) = p(c).getInt("tvhome", 0)             // 0 = fast native home, 1 = YouTube web
     fun setTvHome(c: Context, v: Int) = p(c).edit().putInt("tvhome", v).apply()
     fun diag(c: Context): String = p(c).getString("diag", "") ?: ""
@@ -179,6 +198,11 @@ object Throttle {
 }
 
 object Usb {
+    /**
+     * An open file we are saving into.
+     * [delete] removes a half-finished file. [finish] is called once the download succeeded:
+     * only the MediaStore mode uses it (it clears the "pending" flag so the video becomes visible); other modes do nothing.
+     */
     class Out(val pfd: ParcelFileDescriptor, val delete: () -> Unit, val finish: () -> Unit = {})
     class Setup(val ok: Boolean, val msg: String, val needPerm: Boolean = false)
 
@@ -186,8 +210,7 @@ object Usb {
         c.getExternalFilesDirs(null).filterNotNull().firstOrNull { Environment.isExternalStorageRemovable(it) }
 
     /** Where we save when no picker folder is set: the direct USB folder first, then the app's own USB/SD folder. */
-    fun dir(c: Context): File? =
-        if (Prefs.ms(c) != null) null else Prefs.direct(c)?.let { File(it) } ?: appDir(c)
+    fun dir(c: Context): File? = Prefs.direct(c)?.let { File(it) } ?: appDir(c)
 
     /** null = we can write here, otherwise the reason it failed. */
     fun tryWrite(d: File?): String? {
@@ -245,140 +268,183 @@ object Usb {
         return out.distinct()
     }
 
-    // ---------------------------------------------------------------------------------------
-    // MediaStore mode: used when the TV blocks plain file access to the USB drive (EPERM).
-    // Files are created through Android's own media database, which knows the USB volume.
-    // They land in  <USB>/Download/AdvancePlay/
-    // ---------------------------------------------------------------------------------------
-    private const val MS_REL = "Download/AdvancePlay/"
-
-    /** Names of plugged-in USB / SD volumes known to the media database (empty before Android 10). */
-    fun msVolumes(c: Context): List<String> {
-        if (Build.VERSION.SDK_INT < 29) return emptyList()
-        return try {
-            MediaStore.getExternalVolumeNames(c)
-                .filter { it != MediaStore.VOLUME_EXTERNAL_PRIMARY && it != MediaStore.VOLUME_EXTERNAL }
-        } catch (e: Exception) { emptyList() }
-    }
-
-    private fun msBase(vol: String): Uri = MediaStore.Downloads.getContentUri(vol)
-
-    private fun msFind(c: Context, vol: String, name: String): Uri? {
-        if (Build.VERSION.SDK_INT < 29) return null
-        return try {
-            c.contentResolver.query(
-                msBase(vol), arrayOf(MediaStore.MediaColumns._ID),
-                MediaStore.MediaColumns.DISPLAY_NAME + "=? AND " + MediaStore.MediaColumns.RELATIVE_PATH + "=?",
-                arrayOf(name, MS_REL), null
-            )?.use { q -> if (q.moveToFirst()) ContentUris.withAppendedId(msBase(vol), q.getLong(0)) else null }
-        } catch (e: Exception) { null }
-    }
-
-    /** Creates a new empty file on the USB through the media database and opens it for writing. */
-    private fun msOpen(c: Context, vol: String, name: String, mime: String, overwrite: Boolean = true): Out {
-        if (Build.VERSION.SDK_INT < 29) throw IOException("This Android version cannot use the media database")
-        val cr = c.contentResolver
-        if (overwrite) msFind(c, vol, name)?.let { try { cr.delete(it, null, null) } catch (_: Exception) {} }
-        val cv = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-            put(MediaStore.MediaColumns.MIME_TYPE, mime)
-            put(MediaStore.MediaColumns.RELATIVE_PATH, MS_REL.trimEnd('/'))
-            put(MediaStore.MediaColumns.IS_PENDING, 1)
-        }
-        val uri = cr.insert(msBase(vol), cv) ?: throw IOException("The TV would not create a file on the USB")
-        var opened: ParcelFileDescriptor? = null
-        try { opened = cr.openFileDescriptor(uri, "rw") } catch (_: Exception) {}
-        val pfd = opened
-        if (pfd == null) {
-            try { cr.delete(uri, null, null) } catch (_: Exception) {}
-            throw IOException("Cannot open file on USB")
-        }
-        return Out(pfd, { try { cr.delete(uri, null, null) } catch (_: Exception) {} }, {
-            try {
-                cr.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
-            } catch (_: Exception) {}
-        })
-    }
-
-    /** null = this USB volume works, otherwise the reason it did not. */
-    private fun msTry(c: Context, vol: String): String? = try {
-        val o = msOpen(c, vol, "ap_test.txt", "text/plain")
-        try { ParcelFileDescriptor.AutoCloseOutputStream(o.pfd).use { it.write(1) } }
-        finally { o.delete() }
-        null
-    } catch (e: Exception) { e.message ?: e.javaClass.simpleName }
-
-    fun openBackup(c: Context, name: String): Out = msOpen(c, Prefs.ms(c) ?: throw IOException("no USB"), name, "application/json")
-
-    fun readBackup(c: Context, name: String): String? {
-        val vol = Prefs.ms(c) ?: return null
-        val u = msFind(c, vol, name) ?: return null
-        return try { c.contentResolver.openInputStream(u)?.use { String(it.readBytes()) } } catch (e: Exception) { null }
-    }
-
-    /** Videos already saved in MediaStore mode (for the Library screen). */
-    fun msList(c: Context, vol: String, exts: Set<String>): List<Library.Item> {
-        val out = ArrayList<Library.Item>()
-        if (Build.VERSION.SDK_INT < 29) return out
-        try {
-            c.contentResolver.query(
-                msBase(vol),
-                arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.SIZE, MediaStore.MediaColumns.DATE_MODIFIED),
-                MediaStore.MediaColumns.RELATIVE_PATH + "=?", arrayOf(MS_REL), null
-            )?.use { q ->
-                while (q.moveToNext()) {
-                    val n = q.getString(1) ?: continue
-                    if (n.substringAfterLast('.', "").lowercase() !in exts) continue
-                    out.add(Library.Item(n, ContentUris.withAppendedId(msBase(vol), q.getLong(0)), q.getLong(2), q.getLong(3) * 1000))
-                }
-            }
-        } catch (_: Exception) {}
-        return out
-    }
-
-    private fun msVolumeDir(c: Context, vol: String): File? = try {
-        if (Build.VERSION.SDK_INT >= 30)
-            c.getSystemService(StorageManager::class.java).storageVolumes
-                .firstOrNull { it.uuid.equals(vol, true) }?.directory
-        else null
-    } catch (e: Exception) { null }
-
-    /** "Use USB drive": finds the plugged-in drive and the first folder on it we are allowed to write to. */
+    /**
+     * "Use USB drive": finds the plugged-in drive and the first folder on it we are allowed to write to.
+     * If no folder works (some TVs), it falls back to MediaStore mode (Android 10 and newer).
+     */
     fun setupDirect(c: Context): Setup {
         val roots = volumeRoots(c)
-        if (roots.isEmpty() && msVolumes(c).isEmpty()) {
+        val mediaVols = mediaVolumes(c)
+        if (roots.isEmpty() && mediaVols.isEmpty()) {
             Prefs.setDiag(c, "No USB drive found by the app.")
             return Setup(false, "No USB drive found. Plug it in and try again.")
         }
         val log = StringBuilder("Tried these places:\n")
         for (d in candidates(c)) {
             val e = tryWrite(d)
-            if (e == null) { Prefs.setDirect(c, d.path); Prefs.setMs(c, null); Prefs.setTree(c, null); Prefs.setDiag(c, ""); return Setup(true, d.path) }
+            if (e == null) { Prefs.setDirect(c, d.path); Prefs.setTree(c, null); Prefs.setDiag(c, ""); return Setup(true, d.path) }
             log.append(d.path.removePrefix("/storage/")).append("  ->  ").append(e.take(70)).append('\n')
         }
-        // Plain file access is blocked (EPERM on many TVs). Try the media database instead.
-        for (vol in msVolumes(c)) {
-            val e = msTry(c, vol)
-            if (e == null) {
-                Prefs.setMs(c, vol); Prefs.setDirect(c, null); Prefs.setTree(c, null); Prefs.setDiag(c, "")
-                return Setup(true, "USB drive ($vol) in folder " + MS_REL.trimEnd('/'))
-            }
-            log.append("media database ").append(vol).append("  ->  ").append(e.take(70)).append('\n')
-        }
-        if (msVolumes(c).isEmpty()) log.append("media database: no USB volume found\n")
+        setupMedia(c, mediaVols, log)?.let { return it }
         Prefs.setDiag(c, log.toString())
         val needPerm = if (Build.VERSION.SDK_INT >= 30) !Environment.isExternalStorageManager()
         else ContextCompat.checkSelfPermission(c, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
         return Setup(false, "The TV would not let the app save on this USB drive. Details are shown on the screen.", needPerm)
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // MediaStore mode: saves through Android's media database using the volume's real name
+    // (for example "7245-1da0"), because some TVs reject plain file paths such as /storage/sda1.
+    // ---------------------------------------------------------------------------------------------
+
+    /** Short readable text of an error, to show on the screen. */
+    private fun why(e: Throwable): String = (e.javaClass.simpleName + ": " + (e.message ?: "")).trim().take(160)
+
+    /** Names MediaStore uses for the plugged-in USB drives / SD cards (never the TV's own memory). Android 10+ only. */
+    fun mediaVolumes(c: Context): List<String> {
+        if (Build.VERSION.SDK_INT < 29) return emptyList()
+        val out = LinkedHashSet<String>()
+        try {
+            c.getSystemService(StorageManager::class.java).storageVolumes.forEach { v ->
+                val n = v.mediaStoreVolumeName
+                if (n != null && (v.isRemovable || !v.isPrimary) && v.state == Environment.MEDIA_MOUNTED) out.add(n)
+            }
+        } catch (_: Exception) {}
+        try {
+            MediaStore.getExternalVolumeNames(c).forEach { out.add(it) }
+        } catch (_: Exception) {}
+        out.removeAll(setOf(MediaStore.VOLUME_EXTERNAL_PRIMARY, "external", "internal"))
+        return out.toList()
+    }
+
+    /** True when this MediaStore volume is plugged in and mounted right now. */
+    fun mediaAttached(c: Context, vol: String): Boolean {
+        if (Build.VERSION.SDK_INT < 29) return false
+        return try {
+            val listed = MediaStore.getExternalVolumeNames(c).any { it.equals(vol, true) }
+            if (!listed) false
+            else {
+                val sv = c.getSystemService(StorageManager::class.java).storageVolumes
+                    .firstOrNull { it.mediaStoreVolumeName.equals(vol, true) }
+                sv == null || sv.state == Environment.MEDIA_MOUNTED
+            }
+        } catch (_: Exception) { false }
+    }
+
+    /** Folder of the USB drive on the TV's file system (used only for free space and the optional re-scan). */
+    fun mediaVolumeDir(c: Context, vol: String): File? {
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                val sv = c.getSystemService(StorageManager::class.java).storageVolumes
+                    .firstOrNull { it.mediaStoreVolumeName.equals(vol, true) }
+                val d = sv?.let { volDir(it) }
+                if (d != null) return d
+            }
+        } catch (_: Exception) {}
+        volumeRoots(c).firstOrNull { it.name.equals(vol, true) }?.let { return it }
+        for (n in listOf(vol, vol.uppercase())) {
+            val f = File("/storage/$n")
+            if (f.isDirectory) return f
+        }
+        return null
+    }
+
+    /** Runs a MediaStore query. includePending = also return files that are still being written (Android 12+). */
+    fun mediaQuery(
+        c: Context, coll: Uri, proj: Array<String>, sel: String, args: Array<String>,
+        includePending: Boolean = false, sort: String? = null
+    ): Cursor? {
+        if (includePending && Build.VERSION.SDK_INT >= 31) {
+            val b = Bundle().apply {
+                putString(ContentResolver.QUERY_ARG_SQL_SELECTION, sel)
+                putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, args)
+                if (sort != null) putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER, sort)
+                putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE)
+            }
+            return c.contentResolver.query(coll, proj, b, null)
+        }
+        return c.contentResolver.query(coll, proj, sel, args, sort)
+    }
+
+    /** ids of the files in this collection with exactly this name inside this folder (e.g. "Movies/AdvancePlay"). */
+    fun mediaFind(c: Context, coll: Uri, name: String, rel: String, includePending: Boolean): List<Long> {
+        val out = ArrayList<Long>()
+        val sel = MediaStore.MediaColumns.DISPLAY_NAME + " = ? AND (" +
+            MediaStore.MediaColumns.RELATIVE_PATH + " = ? OR " + MediaStore.MediaColumns.RELATIVE_PATH + " = ?)"
+        mediaQuery(c, coll, arrayOf(MediaStore.MediaColumns._ID), sel, arrayOf(name, rel, "$rel/"), includePending)?.use { cu ->
+            while (cu.moveToNext()) out.add(cu.getLong(0))
+        }
+        return out
+    }
+
+    /** Real test: creates a tiny file on the volume through MediaStore, writes to it, deletes it. null = works, else the reason. */
+    private fun testMedia(c: Context, vol: String): String? {
+        var uri: Uri? = null
+        var err: String? = null
+        val cr = c.contentResolver
+        try {
+            val cv = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, "ap_test_" + System.currentTimeMillis() + ".mp4")
+                put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, "Movies/AdvancePlay")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            uri = cr.insert(MediaStore.Video.Media.getContentUri(vol), cv)
+            if (uri == null) throw IOException("MediaStore did not create the test file")
+            val pfd = cr.openFileDescriptor(uri, "w") ?: throw IOException("MediaStore could not open the test file")
+            ParcelFileDescriptor.AutoCloseOutputStream(pfd).use { it.write(ByteArray(16) { 1 }) }
+        } catch (e: Exception) {
+            err = why(e)
+        } finally {
+            if (uri != null) { try { cr.delete(uri, null, null) } catch (_: Exception) {} }
+        }
+        return err
+    }
+
+    /** Tries every USB volume MediaStore knows; the first one that really accepts a test file becomes the saving target. */
+    private fun setupMedia(c: Context, vols: List<String>, log: StringBuilder): Setup? {
+        if (Build.VERSION.SDK_INT < 29) return null
+        log.append("MediaStore volumes: ").append(if (vols.isEmpty()) "none" else vols.joinToString(", ")).append('\n')
+        for (v in vols) {
+            val e = testMedia(c, v)
+            if (e == null) {
+                Prefs.setMedia(c, v); Prefs.setDiag(c, "")
+                Thread { scanFolder(c) }.start()
+                return Setup(true, "USB drive ($v)")
+            }
+            log.append("MediaStore ").append(v).append("  ->  ").append(e).append('\n')
+        }
+        return null
+    }
+
+    /**
+     * Best effort: asks Android to index videos that are already inside the AdvancePlay folders on the drive.
+     * Limitation: on a TV that cannot use file paths this may do nothing, and a video that was copied onto the drive
+     * by hand (never indexed) will then not show in the Library. Videos downloaded by the app always show.
+     */
+    fun scanFolder(c: Context) {
+        try {
+            val vol = Prefs.media(c) ?: return
+            val root = mediaVolumeDir(c, vol) ?: return
+            val files = ArrayList<String>()
+            for (rel in listOf("Movies/AdvancePlay", "Music/AdvancePlay")) {
+                File(root, rel).listFiles()?.forEach { if (it.isFile && Library.ok(it.name)) files.add(it.path) }
+            }
+            if (files.isNotEmpty()) MediaScannerConnection.scanFile(c, files.toTypedArray(), null, null)
+        } catch (_: Exception) {}
+    }
+
     /** Silent: on every start (and after a reinstall) find the USB folder again by itself and restore the backup. */
     fun autoSetup(c: Context) {
         if (Prefs.tree(c) != null) return
-        val ms = Prefs.ms(c)
-        if (ms != null && ms in msVolumes(c)) return
-        val cur = Prefs.direct(c)
-        if (ms == null && cur != null && File(cur).isDirectory) return
+        val med = Prefs.media(c)
+        if (med != null) {
+            // MediaStore mode: nothing to do while the same drive is still plugged in
+            if (mediaAttached(c, med)) { Thread { scanFolder(c) }.start(); return }
+        } else {
+            val cur = Prefs.direct(c)
+            if (cur != null && File(cur).isDirectory) return
+        }
         if (setupDirect(c).ok) { Backup.restore(c); Backup.save(c) }
     }
 
@@ -392,8 +458,9 @@ object Usb {
                 return "On TV choose a folder on the USB drive, not the TV memory"
             return null
         }
-        val ms = Prefs.ms(c)
-        if (ms != null) return if (ms in msVolumes(c)) null else "USB drive not found. Plug it in, then open Settings and press Use USB drive"
+        val med = Prefs.media(c)
+        if (med != null)   // MediaStore mode: fine while the drive is plugged in and mounted
+            return if (mediaAttached(c, med)) null else "No USB drive found. Plug it in, then open Settings and press Use USB drive"
         val d = dir(c) ?: return if (Dev.isTv(c)) "No USB drive found. Plug it in, then open Settings and press Use USB drive"
         else "Insert an SD card or choose a download folder in Settings"
         return if (writable(d)) null else "Cannot save to the USB yet. Open Settings and press Use USB drive"
@@ -401,7 +468,18 @@ object Usb {
 
     fun hasTarget(c: Context) = check(c) == null
 
-    fun tempDir(c: Context): File = dir(c)?.takeIf { writable(it) } ?: c.cacheDir
+    /**
+     * Where the two half files (video + sound) are kept before they are merged.
+     * MediaStore mode cannot use a plain folder on the drive, so we use the app's own folder on the USB
+     * when it is writable AND has at least 2 GB free; otherwise the app's cache folder in TV memory.
+     */
+    fun tempDir(c: Context): File {
+        if (Prefs.media(c) != null) {
+            val usb = appDir(c)?.takeIf { writable(it) && it.usableSpace >= 2L * 1024 * 1024 * 1024 }
+            return usb ?: c.cacheDir
+        }
+        return dir(c)?.takeIf { writable(it) } ?: c.cacheDir
+    }
 
     /** Pair(free, total) of the USB volume, or null if not connected. */
     fun space(c: Context): Pair<Long, Long>? = try {
@@ -413,8 +491,11 @@ object Usb {
                     c.getSystemService(StorageManager::class.java).storageVolumes
                         .firstOrNull { it.uuid.equals(uuid, true) }?.directory
                 else null
-        } else if (Prefs.ms(c) != null) msVolumeDir(c, Prefs.ms(c)!!)
-        else dir(c)
+        } else if (Prefs.media(c) != null) {
+            // MediaStore mode: free space of the USB volume whose MediaStore name we saved
+            val m = Prefs.media(c)!!
+            if (mediaAttached(c, m)) mediaVolumeDir(c, m) else null
+        } else dir(c)
         d?.let { val s = StatFs(it.path); s.availableBytes to s.totalBytes }
     } catch (e: Exception) { null }
 
@@ -428,16 +509,85 @@ object Usb {
             dir.findFile(name)?.delete()
             val f = dir.createFile(mime, name) ?: throw IOException("Cannot create file on USB")
             val pfd = c.contentResolver.openFileDescriptor(f.uri, "rw") ?: throw IOException("Cannot open file on USB")
-            return Out(pfd) { f.delete() }
+            return Out(pfd, { f.delete() })
         }
-        Prefs.ms(c)?.let { return msOpen(c, it, name, mime) }
+        val med = Prefs.media(c)
+        if (med != null) return openMedia(c, med, name, mime)
         val d = dir(c) ?: throw IOException("No USB drive found. Open Settings and press Use USB drive")
         val file = File(d, name)
         val pfd = ParcelFileDescriptor.open(
             file,
             ParcelFileDescriptor.MODE_READ_WRITE or ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_TRUNCATE
         )
-        return Out(pfd) { file.delete() }
+        return Out(pfd, { file.delete() })
+    }
+
+    /** USB drive (MediaStore) mode: removes our file with this name through MediaStore. True when something was deleted. */
+    fun mediaDeleteByName(c: Context, name: String): Boolean {
+        val vol = Prefs.media(c) ?: return false
+        if (Build.VERSION.SDK_INT < 29) return false
+        var n = 0
+        for (coll in listOf(MediaStore.Video.Media.getContentUri(vol), MediaStore.Audio.Media.getContentUri(vol), MediaStore.Files.getContentUri(vol))) {
+            try {
+                n += c.contentResolver.delete(coll, MediaStore.MediaColumns.DISPLAY_NAME + " = ? AND " + MediaStore.MediaColumns.DATA + " LIKE ?",
+                    arrayOf(name, "%/AdvancePlay/%"))
+            } catch (_: Exception) {}
+        }
+        return n > 0
+    }
+
+    private fun isAudioName(n: String) = n.substringAfterLast('.', "").lowercase() == "m4a"
+
+    /**
+     * MediaStore mode: creates the file through MediaStore (videos in Movies/AdvancePlay, audio in Music/AdvancePlay)
+     * and returns an open file for the download engine. The file stays "pending" (invisible) until finish() is called.
+     */
+    private fun openMedia(c: Context, vol: String, name: String, mime: String): Out {
+        if (Build.VERSION.SDK_INT < 29) throw IOException("USB drive mode needs Android 10 or newer")
+        val cr = c.contentResolver
+        try {
+            val audio = isAudioName(name)
+            val coll = if (audio) MediaStore.Audio.Media.getContentUri(vol) else MediaStore.Video.Media.getContentUri(vol)
+            val rel = if (audio) "Music/AdvancePlay" else "Movies/AdvancePlay"
+            val type = if (audio) (if (mime.startsWith("audio/")) mime else "audio/mp4")
+                       else (if (mime.startsWith("video/")) mime else "video/mp4")
+            // remove an older file with the same name first, otherwise Android would call the new one "name (1).mp4"
+            try {
+                for (id in mediaFind(c, coll, name, rel, true)) {
+                    try { cr.delete(ContentUris.withAppendedId(coll, id), null, null) } catch (_: Exception) {}
+                }
+            } catch (_: Exception) {}
+            val cv = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, type)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, rel)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val uri = cr.insert(coll, cv) ?: throw IOException("The TV would not create the file on the USB drive")
+            val pfd: ParcelFileDescriptor? = try {
+                try { cr.openFileDescriptor(uri, "rw") } catch (e: Exception) { cr.openFileDescriptor(uri, "w") }
+            } catch (e: Exception) {
+                try { cr.delete(uri, null, null) } catch (_: Exception) {}
+                throw e
+            }
+            if (pfd == null) {
+                try { cr.delete(uri, null, null) } catch (_: Exception) {}
+                throw IOException("Cannot open file on USB")
+            }
+            return Out(
+                pfd,
+                { try { cr.delete(uri, null, null) } catch (_: Exception) {} },
+                {
+                    // download finished: clear the pending flag so the video shows up in the Library
+                    val done = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+                    if (cr.update(uri, done, null, null) <= 0) throw IOException("Could not finish the file on the USB drive")
+                }
+            )
+        } catch (e: Exception) {
+            val m = why(e)
+            Prefs.setDiag(c, "Saving to the USB drive (MediaStore) failed:\n$m")
+            throw IOException(m)
+        }
     }
 }
 
@@ -479,17 +629,19 @@ object Dev {
 object Library {
     class Item(val name: String, val uri: Uri, val size: Long, val modified: Long)
     private val exts = setOf("mp4", "m4a", "mkv", "webm")
-    private fun ok(n: String?) = n != null && n.substringAfterLast('.', "").lowercase() in exts
+    /** True for file names the Library shows (mp4, m4a, mkv, webm). */
+    fun ok(n: String?) = n != null && n.substringAfterLast('.', "").lowercase() in exts
 
     fun list(c: Context): List<Item> {
         val tree = Prefs.tree(c)
+        val media = Prefs.media(c)
         val out = ArrayList<Item>()
         if (tree != null) {
             DocumentFile.fromTreeUri(c, tree)?.listFiles()?.forEach {
                 if (it.isFile && ok(it.name)) out.add(Item(it.name!!, it.uri, it.length(), it.lastModified()))
             }
-        } else if (Prefs.ms(c) != null) {
-            out.addAll(Usb.msList(c, Prefs.ms(c)!!, exts))
+        } else if (media != null) {
+            listMedia(c, media, out)
         } else {
             Usb.dir(c)?.listFiles()?.forEach {
                 if (it.isFile && ok(it.name)) out.add(Item(it.name, Uri.fromFile(it), it.length(), it.lastModified()))
@@ -497,11 +649,71 @@ object Library {
         }
         return out.sortedByDescending { it.modified }
     }
+
+    /**
+     * USB drive (MediaStore) mode: lists our finished videos and audio files. Three sources are combined, because some TVs
+     * do not fill in every MediaStore field: (1) the Video and Audio lists, (2) the "Files" list, (3) the AdvancePlay folders
+     * on the drive itself. A file found by several sources is shown once. If nothing is found, the counts are written to the
+     * Settings screen so they can be photographed.
+     */
+    private fun listMedia(c: Context, vol: String, out: MutableList<Item>) {
+        val byName = LinkedHashMap<String, Item>()
+        fun put(n: String, uri: Uri, size: Long, mod: Long) {
+            val k = n.lowercase()
+            val old = byName[k]
+            if (old == null) byName[k] = Item(n, uri, size, mod)
+            else if (old.size <= 0L || old.modified <= 0L)          // keep the first link, but fill in missing size / date
+                byName[k] = Item(old.name, old.uri, if (old.size > 0L) old.size else size, if (old.modified > 0L) old.modified else mod)
+        }
+        var nStore = 0; var nFiles = 0; var nFolder = 0
+        var problem: String? = null
+        if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                val proj = arrayOf(
+                    MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.SIZE,
+                    MediaStore.MediaColumns.DATE_MODIFIED
+                )
+                val sel = "(" + MediaStore.MediaColumns.RELATIVE_PATH + " LIKE ? OR " + MediaStore.MediaColumns.DATA + " LIKE ?) AND " +
+                    MediaStore.MediaColumns.IS_PENDING + " = 0"
+                val sets = listOf(
+                    Triple(MediaStore.Video.Media.getContentUri(vol), "Movies/AdvancePlay", 0),
+                    Triple(MediaStore.Audio.Media.getContentUri(vol), "Music/AdvancePlay", 0),
+                    Triple(MediaStore.Files.getContentUri(vol), "%AdvancePlay", 1)
+                )
+                for ((coll, rel, kind) in sets) {
+                    try {
+                        Usb.mediaQuery(c, coll, proj, sel, arrayOf("$rel%", "%/AdvancePlay/%"))?.use { cu ->
+                            while (cu.moveToNext()) {
+                                val name = cu.getString(1)
+                                if (!ok(name)) continue
+                                put(name, ContentUris.withAppendedId(coll, cu.getLong(0)), cu.getLong(2), cu.getLong(3) * 1000)
+                                if (kind == 0) nStore++ else nFiles++
+                            }
+                        }
+                    } catch (e: Exception) { problem = (e.message ?: e.javaClass.simpleName).take(120) }
+                }
+            } catch (e: Exception) { problem = (e.message ?: e.javaClass.simpleName).take(120) }
+        }
+        try {
+            val root = Usb.mediaVolumeDir(c, vol)
+            if (root != null) for (rel in listOf("Movies/AdvancePlay", "Music/AdvancePlay")) {
+                File(root, rel).listFiles()?.forEach { f ->
+                    if (f.isFile && !f.name.startsWith(".") && ok(f.name)) { put(f.name, Uri.fromFile(f), f.length(), f.lastModified()); nFolder++ }
+                }
+            }
+        } catch (_: Exception) {}
+        out.addAll(byName.values)
+        val d = Prefs.diag(c)
+        if (out.isEmpty()) Prefs.setDiag(c, "Library found nothing on the USB drive.\nMediaStore videos/audio: $nStore, files list: $nFiles, folder: $nFolder" +
+            (if (problem != null) "\nError: $problem" else ""))
+        else if (d.startsWith("Library found nothing")) Prefs.setDiag(c, "")
+    }
 }
 
 /** Backup file kept next to the videos (USB / SD card). Survives uninstall + reinstall. */
 object Backup {
     private const val NAME = "AdvancePlay-backup.json"
+    private const val REL = "Download/AdvancePlay"      // MediaStore mode: folder on the USB drive
 
     @Synchronized fun save(c: Context): Boolean {
         try {
@@ -510,6 +722,7 @@ object Backup {
                 put("total", Prefs.total(c)); put("cap", Prefs.cap(c)); put("quality", Prefs.quality(c))
                 put("max", Prefs.maxSpeed(c)); put("layout", Prefs.layout(c)); put("lastDone", Prefs.lastDone(c))
                 put("updated", ts)
+                put("history", History.export(c)); put("recent", Recents.export(c))   // downloaded / watched videos and recent searches
             }.toString()
             val tree = Prefs.tree(c)
             if (tree != null) {
@@ -517,10 +730,8 @@ object Backup {
                 if (!dir.canWrite()) return false
                 val f = dir.findFile(NAME) ?: dir.createFile("application/json", NAME) ?: return false
                 c.contentResolver.openOutputStream(f.uri, "wt")?.use { it.write(txt.toByteArray()) } ?: return false
-            } else if (Prefs.ms(c) != null) {
-                val o = Usb.openBackup(c, NAME)
-                ParcelFileDescriptor.AutoCloseOutputStream(o.pfd).use { it.write(txt.toByteArray()) }
-                o.finish()
+            } else if (Prefs.media(c) != null) {
+                if (!saveMedia(c, Prefs.media(c)!!, txt)) return false
             } else {
                 val d = Usb.dir(c) ?: return false
                 File(d, NAME).writeText(txt)
@@ -530,6 +741,59 @@ object Backup {
         } catch (e: Exception) { return false }
     }
 
+    /**
+     * MediaStore mode: writes the backup into Download/AdvancePlay on the USB drive.
+     * First tries to overwrite the existing file; if that is not allowed it deletes the old one and creates a new one.
+     * Never throws: returns false when it did not work.
+     */
+    private fun saveMedia(c: Context, vol: String, txt: String): Boolean {
+        if (Build.VERSION.SDK_INT < 29) return false
+        try {
+            val cr = c.contentResolver
+            val coll = MediaStore.Downloads.getContentUri(vol)
+            val ids = Usb.mediaFind(c, coll, NAME, REL, true)
+            for (id in ids) {
+                try {
+                    val os = cr.openOutputStream(ContentUris.withAppendedId(coll, id), "wt")
+                    if (os != null) { os.use { it.write(txt.toByteArray()) }; return true }
+                } catch (_: Exception) {}
+            }
+            for (id in ids) { try { cr.delete(ContentUris.withAppendedId(coll, id), null, null) } catch (_: Exception) {} }
+            val cv = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, NAME)
+                put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, REL)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val uri = cr.insert(coll, cv) ?: return false
+            try {
+                val os = cr.openOutputStream(uri, "w") ?: throw IOException("cannot open backup file")
+                os.use { it.write(txt.toByteArray()) }
+                val done = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+                cr.update(uri, done, null, null)
+            } catch (e: Exception) {
+                try { cr.delete(uri, null, null) } catch (_: Exception) {}
+                return false
+            }
+            return true
+        } catch (e: Exception) { return false }
+    }
+
+    /** MediaStore mode: reads the newest backup text from Download/AdvancePlay on the USB drive, or null (also after a reinstall if Android refuses). */
+    private fun readMedia(c: Context, vol: String): String? {
+        if (Build.VERSION.SDK_INT < 29) return null
+        try {
+            val coll = MediaStore.Downloads.getContentUri(vol)
+            val sel = MediaStore.MediaColumns.DISPLAY_NAME + " = ? AND (" + MediaStore.MediaColumns.RELATIVE_PATH + " = ? OR " +
+                MediaStore.MediaColumns.RELATIVE_PATH + " = ?) AND " + MediaStore.MediaColumns.IS_PENDING + " = 0"
+            var id = -1L
+            Usb.mediaQuery(c, coll, arrayOf(MediaStore.MediaColumns._ID), sel, arrayOf(NAME, REL, "$REL/"), false,
+                MediaStore.MediaColumns.DATE_MODIFIED + " DESC")?.use { cu -> if (cu.moveToFirst()) id = cu.getLong(0) }
+            if (id < 0) return null
+            return c.contentResolver.openInputStream(ContentUris.withAppendedId(coll, id))?.use { String(it.readBytes()) }
+        } catch (e: Exception) { return null }
+    }
+
     /** Returns true when data was restored from an existing backup. */
     @Synchronized fun restore(c: Context): Boolean {
         try {
@@ -537,8 +801,8 @@ object Backup {
             val txt: String = if (tree != null) {
                 val f = DocumentFile.fromTreeUri(c, tree)?.findFile(NAME) ?: return false
                 c.contentResolver.openInputStream(f.uri)?.use { String(it.readBytes()) } ?: return false
-            } else if (Prefs.ms(c) != null) {
-                Usb.readBackup(c, NAME) ?: return false
+            } else if (Prefs.media(c) != null) {
+                readMedia(c, Prefs.media(c)!!) ?: return false
             } else {
                 val f = File(Usb.dir(c) ?: return false, NAME)
                 if (!f.exists()) return false
@@ -553,6 +817,7 @@ object Backup {
             Prefs.setMaxSpeed(c, j.optBoolean("max", false))
             Prefs.setLayout(c, j.optInt("layout", 0))
             if (Prefs.lastDone(c).isEmpty()) Prefs.setLastDone(c, j.optString("lastDone", ""))
+            History.import(c, j.optJSONObject("history")); Recents.import(c, j.optJSONArray("recent"))
             Prefs.setBkTs(c, ts)
             Throttle.maxSpeed = Prefs.maxSpeed(c)
             return true

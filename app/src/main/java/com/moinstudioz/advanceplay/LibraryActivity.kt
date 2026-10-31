@@ -20,6 +20,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -38,6 +39,10 @@ class LibraryActivity : ComponentActivity() {
     private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density + .5f).toInt()
+    private fun clock(ms: Long): String {
+        val t = ms / 1000
+        return if (t >= 3600) String.format("%d:%02d:%02d", t / 3600, (t % 3600) / 60, t % 60) else String.format("%d:%02d", t / 60, t % 60)
+    }
     private fun shape(fill: Int, stroke: Int, w: Int) = GradientDrawable().apply {
         cornerRadius = dp(22).toFloat(); setColor(fill); setStroke(dp(w), stroke)
     }
@@ -58,7 +63,7 @@ class LibraryActivity : ComponentActivity() {
                 }
                 setOnClickListener {
                     startActivity(Intent(this@LibraryActivity, PlayerActivity::class.java)
-                        .putExtra("uri", v.uri.toString()).putExtra("name", v.name))
+                        .putExtra("uri", v.uri.toString()).putExtra("name", v.name).putExtra("fkey", v.name))
                 }
                 setOnLongClickListener { confirmDelete(v); true }
             }
@@ -74,8 +79,11 @@ class LibraryActivity : ComponentActivity() {
                 typeface = Typeface.DEFAULT_BOLD; maxLines = 2; ellipsize = TextUtils.TruncateAt.END
             })
             col.addView(TextView(this@LibraryActivity).apply {
+                val resume = Prefs.pos(this@LibraryActivity, v.name)
+                val tag = if (History.isWatched(this@LibraryActivity, "f:" + v.name)) "  \u00B7  \u2714 Watched"
+                          else if (resume > 5000) "  \u00B7  Resume " + clock(resume) else ""
                 text = Formatter.formatFileSize(this@LibraryActivity, v.size) + "  \u00B7  " +
-                    DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(v.modified))
+                    DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(v.modified)) + tag
                 setTextColor(0xFF9A9A9A.toInt()); textSize = 12f
             })
             row.addView(col, LinearLayout.LayoutParams(0, WRAP, 1f))
@@ -127,16 +135,34 @@ class LibraryActivity : ComponentActivity() {
         }.start()
     }
 
-    private fun confirmDelete(it: Library.Item) {
-        AlertDialog.Builder(this).setTitle("Delete this video?").setMessage(it.name)
+    private fun confirmDelete(v: Library.Item) {
+        AlertDialog.Builder(this).setTitle("Delete this video?").setMessage(v.name)
             .setPositiveButton("Delete") { _, _ ->
                 Thread {
+                    val media = Prefs.media(this) != null      // USB drive (MediaStore) mode
+                    var problem: String? = null
                     try {
-                        if (it.uri.scheme == "file") File(it.uri.path!!).delete()
-                        else if (it.uri.authority == "media") contentResolver.delete(it.uri, null, null)
-                        else DocumentsContract.deleteDocument(contentResolver, it.uri)
-                    } catch (_: Exception) {}
-                    runOnUiThread { reload() }
+                        if (v.uri.scheme == "file") {
+                            // a file found in the folder: if the TV refuses a plain delete, ask MediaStore to remove it
+                            if (!File(v.uri.path!!).delete() && media && !Usb.mediaDeleteByName(this, v.name)) problem = "Could not delete this video"
+                        }
+                        else if (media) {
+                            // MediaStore mode: delete the row, Android deletes the file on the USB too
+                            if (contentResolver.delete(v.uri, null, null) <= 0) problem = "Could not delete this video"
+                        }
+                        else DocumentsContract.deleteDocument(contentResolver, v.uri)
+                    } catch (e: SecurityException) {
+                        // includes RecoverableSecurityException: Android did not allow us to delete a file we did not create
+                        if (media) problem = "Android did not allow deleting this video"
+                    } catch (e: Exception) {
+                        if (media) problem = "Could not delete: " + (e.message ?: e.javaClass.simpleName).take(80)
+                    }
+                    if (problem == null) History.forgetFile(this, v.name)
+                    val msg: String? = problem
+                    runOnUiThread {
+                        if (msg != null) Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                        reload()
+                    }
                 }.start()
             }.setNegativeButton("Cancel", null).show()
     }

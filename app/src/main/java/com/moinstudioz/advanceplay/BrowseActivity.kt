@@ -11,7 +11,9 @@ import android.graphics.drawable.StateListDrawable
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.Editable
 import android.text.TextUtils
+import android.text.TextWatcher
 import android.text.format.Formatter
 import android.view.Gravity
 import android.view.KeyEvent
@@ -24,6 +26,7 @@ import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -68,6 +71,7 @@ class BrowseActivity : ComponentActivity() {
     private var seenDone = 0
     private var seenErr = 0
     private val h = Handler(Looper.getMainLooper())
+    private var splash: SplashView? = null          // the Moin Studioz intro video that covers the screen at start
 
     private lateinit var root: FrameLayout
     private lateinit var content: LinearLayout
@@ -124,15 +128,22 @@ class BrowseActivity : ComponentActivity() {
         override fun onBindViewHolder(h: VH, i: Int) {
             val v = items[i]
             h.title.text = v.name
+            val vid = History.idOf(v.url)
+            val wp = History.progressOf(this@BrowseActivity, vid)
             h.sub.text = listOfNotNull(
                 v.uploaderName?.takeIf { it.isNotBlank() },
-                if (v.viewCount >= 0) views(v.viewCount) else null
+                if (v.viewCount >= 0) views(v.viewCount) else null,
+                if (History.isDownloaded(this@BrowseActivity, vid)) "\u2714 Downloaded" else null,
+                if (wp != null) (if (wp.finished) "Watched" else "Watched " + wp.percent + "%")
+                else if (History.isWatched(this@BrowseActivity, vid)) "Watched" else null
             ).joinToString("  \u00B7  ")
             h.dur.text = if (v.duration > 0) dur(v.duration) else "LIVE"
             h.dur.setTextColor(if (v.duration > 0) Color.WHITE else RED)
-            Thumbs.load(v.thumbnails.firstOrNull { it.height in 150..420 }?.url ?: v.thumbnails.lastOrNull()?.url, h.img)
+            val thumbUrl = v.thumbnails.firstOrNull { it.height in 150..420 }?.url ?: v.thumbnails.lastOrNull()?.url
+            Thumbs.load(thumbUrl, h.img)
             h.card.setOnClickListener {
-                startActivity(Intent(this@BrowseActivity, PlayerActivity::class.java).putExtra("yt", v.url).putExtra("name", v.name))
+                startActivity(Intent(this@BrowseActivity, PlayerActivity::class.java)
+                    .putExtra("yt", v.url).putExtra("name", v.name).putExtra("thumb", thumbUrl ?: ""))
             }
             h.card.setOnLongClickListener { download(v); true }
             if (i >= items.size - 6) more()
@@ -166,7 +177,7 @@ class BrowseActivity : ComponentActivity() {
                 val list = page.items.filterIsInstance<StreamInfoItem>()
                 runOnUiThread { if (g == gen) { extractor = ex; nextPage = page.nextPage; add(list) } }
             } catch (e: Exception) {
-                runOnUiThread { if (g == gen) { busy.text = "Could not load: " + (e.message ?: "error") + "\nPress Home to retry" } }
+                runOnUiThread { if (g == gen) { busy.text = "Could not load: " + (e.message ?: "error") + "\nPress Home to retry"; splash?.contentReady() } }
             } finally { runOnUiThread { if (g == gen) loading = false } }
         }.start()
     }
@@ -193,21 +204,56 @@ class BrowseActivity : ComponentActivity() {
         adapter.notifyItemRangeInserted(start, list.size)
         busy.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
         if (items.isEmpty()) busy.text = "Nothing found"
+        splash?.contentReady()
     }
 
+    /** Search box with the last searches listed below it (up to 20, like YouTube). Hold OK on one to remove it. */
     private fun askSearch() {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), 0) }
         val et = EditText(this).apply {
             hint = "Search YouTube"; setTextColor(Color.WHITE); setHintTextColor(0xFF888888.toInt())
             setSingleLine(true); imeOptions = EditorInfo.IME_ACTION_SEARCH
         }
-        val dlg = AlertDialog.Builder(this).setTitle("Search").setView(et)
-            .setPositiveButton("Search") { _, _ -> et.text.toString().trim().let { if (it.isNotEmpty()) search(it) } }
-            .setNegativeButton("Cancel", null).create()
-        et.setOnEditorActionListener { _, _, _ ->
-            et.text.toString().trim().let { if (it.isNotEmpty()) { dlg.dismiss(); search(it) } }; true
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        box.addView(et, MATCH, WRAP)
+        box.addView(ScrollView(this).apply { addView(list) }, LinearLayout.LayoutParams(MATCH, dp(250)))
+        var dlg: AlertDialog? = null
+
+        fun go(q: String) {
+            val t = q.trim()
+            if (t.isEmpty()) return
+            Recents.add(this, t)
+            dlg?.dismiss()
+            search(t)
         }
-        dlg.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
-        dlg.show(); et.requestFocus()
+        fun row(label: String, click: () -> Unit, hold: (() -> Unit)? = null) = TextView(this).apply {
+            text = label; setTextColor(Color.WHITE); textSize = 16f
+            setPadding(dp(14), dp(11), dp(14), dp(11)); isFocusable = true; isClickable = true
+            background = focusBg(Color.WHITE, 12)
+            setOnClickListener { click() }
+            if (hold != null) setOnLongClickListener { hold(); true }
+        }
+        fun fill() {
+            list.removeAllViews()
+            val f = et.text.toString().trim()
+            val all = Recents.list(this)
+            for (q in all.filter { f.isEmpty() || it.contains(f, true) }.take(20))
+                list.addView(row("\u21BA   " + q, { go(q) }) { Recents.remove(this, q); fill() })
+            if (f.isEmpty() && all.isNotEmpty()) list.addView(row("Clear search history", { Recents.clear(this); fill() }))
+        }
+        et.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+            override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) { fill() }
+        })
+        val d = AlertDialog.Builder(this).setTitle("Search").setView(box)
+            .setPositiveButton("Search") { _, _ -> go(et.text.toString()) }
+            .setNegativeButton("Cancel", null).create()
+        dlg = d
+        et.setOnEditorActionListener { _, _, _ -> go(et.text.toString()); true }
+        d.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
+        fill()
+        d.show(); et.requestFocus()
     }
 
     // ---------- UI ----------
@@ -231,6 +277,16 @@ class BrowseActivity : ComponentActivity() {
         setOnClickListener { click() }
     }
 
+    /** Same as [navItem] but with a letter instead of an icon (Facebook "f", Instagram "IG"). */
+    private fun navGlyph(glyph: String, label: String, c: Int, click: () -> Unit) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+        setPadding(dp(4), dp(8), dp(4), dp(6)); isFocusable = true; isClickable = true
+        background = focusBg(c, 22)
+        addView(TextView(context).apply { text = glyph; textSize = 20f; typeface = Typeface.DEFAULT_BOLD; setTextColor(c); gravity = Gravity.CENTER }, dp(30), dp(30))
+        addView(TextView(context).apply { text = label; textSize = 12f; setTextColor(c); gravity = Gravity.CENTER }, WRAP, WRAP)
+        setOnClickListener { click() }
+    }
+
     private fun buildUi() {
         root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         content = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -240,20 +296,26 @@ class BrowseActivity : ComponentActivity() {
             content.setPadding(i.left + e, i.top + e, i.right + e, i.bottom + e); ins
         }
 
-        // left rail
-        val rail = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; setPadding(dp(6), dp(6), dp(6), dp(6))
+        // left rail (scrolls when there are more buttons than fit on the screen)
+        val rail = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(6), dp(6), dp(6), dp(6)) }
+        val railBox = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false; isFillViewport = true
             background = shape(0xFF141414.toInt(), 0xFF2A2A2A.toInt(), 1, 32)
+            addView(rail, MATCH, WRAP)
         }
-        fun item(icon: Int, label: String, c: Int, click: () -> Unit) =
-            rail.addView(navItem(icon, label, c, click), LinearLayout.LayoutParams(MATCH, 0, 1f).apply { setMargins(0, dp(3), 0, dp(3)) })
+        fun addRail(v: View) = rail.addView(v, LinearLayout.LayoutParams(MATCH, dp(72)).apply { setMargins(0, dp(3), 0, dp(3)) })
+        fun item(icon: Int, label: String, c: Int, click: () -> Unit) = addRail(navItem(icon, label, c, click))
+        fun glyph(g: String, label: String, c: Int, click: () -> Unit) = addRail(navGlyph(g, label, c, click))
         item(R.drawable.ic_home, "Home", Color.WHITE) { search(cats[0].second) }
         item(R.drawable.ic_search, "Search", Color.WHITE) { askSearch() }
         item(R.drawable.ic_library, "Library", Color.WHITE) { startActivity(Intent(this, LibraryActivity::class.java)) }
+        item(R.drawable.ic_play, "Watched", Color.WHITE) { startActivity(Intent(this, WatchedActivity::class.java)) }
+        glyph("f", "Facebook", Color.WHITE) { WebSites.open(this, "facebook") }
+        glyph("IG", "Instagram", Color.WHITE) { WebSites.open(this, "instagram") }
+        item(R.drawable.ic_apps, "Apps", Color.WHITE) { WebSites.showMenu(this, true) }
         item(R.drawable.ic_moon, "Background", Color.WHITE) { enterBlack() }
-        item(R.drawable.ic_reload, "YouTube Web", Color.WHITE) { startActivity(Intent(this, MainActivity::class.java)) }
         item(R.drawable.ic_settings, "Settings", RED) { startActivity(Intent(this, SettingsActivity::class.java)) }
-        content.addView(rail, LinearLayout.LayoutParams(dp(112), MATCH).apply { setMargins(0, 0, dp(12), 0) })
+        content.addView(railBox, LinearLayout.LayoutParams(dp(112), MATCH).apply { setMargins(0, 0, dp(12), 0) })
 
         // right side: categories, grid, status
         val right = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -303,6 +365,11 @@ class BrowseActivity : ComponentActivity() {
             setOnLongClickListener { exitBlack(); true }
         }
         root.addView(black, MATCH, MATCH)
+
+        // Moin Studioz intro video: plays once when the app starts, on top of everything
+        splash = Splash.create(this)
+        splash?.let { root.addView(it, MATCH, MATCH) }
+        h.postDelayed({ splash?.contentReady() }, 15000)      // if the first results are very slow, do not keep the intro waiting
     }
 
     private fun hideBars(hide: Boolean) {
@@ -316,6 +383,7 @@ class BrowseActivity : ComponentActivity() {
     private fun exitBlack() { black.visibility = View.GONE; hideBars(false); grid.requestFocus() }
 
     override fun dispatchKeyEvent(e: KeyEvent): Boolean {
+        if (Splash.blocks(splash, e)) return true          // the intro video plays to the end
         val k = e.keyCode
         if (black.visibility == View.VISIBLE) {
             if (k == KeyEvent.KEYCODE_BACK) { if (e.action == KeyEvent.ACTION_UP) exitBlack(); return true }
