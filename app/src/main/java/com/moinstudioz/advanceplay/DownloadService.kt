@@ -58,7 +58,9 @@ class DownloadService : Service() {
         fg("Preparing...", 0)
         val url = i?.getStringExtra("url")
         if (url == null) { if (pending.get() == 0) stopSelf(); return START_NOT_STICKY }
-        Prefs.addPending(this, url)
+        val direct = i.getStringExtra("direct")           // set for Facebook / Instagram downloads (a plain video file link)
+        Dl.markQueued(url)                                 // also covers downloads resumed after a restart
+        if (direct == null) Prefs.addPending(this, url)
         if (wake == null) {
             wake = getSystemService(PowerManager::class.java)
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "advplay:dl").apply { acquire(6 * 60 * 60 * 1000L) }
@@ -67,18 +69,20 @@ class DownloadService : Service() {
                 .apply { setReferenceCounted(false); acquire() }
         }
         DL.queue = pending.incrementAndGet()
-        exec.execute { work(url) }
+        val title = i.getStringExtra("name")
+        exec.execute { work(url, direct, title) }
         return START_NOT_STICKY
     }
 
-    private fun work(url: String) {
+    private fun work(url: String, direct: String? = null, title: String? = null) {
         try {
-            process(url)
+            if (direct != null) processDirect(direct, title ?: "video") else process(url)
         } catch (e: Exception) {
             val m = e.message ?: e.javaClass.simpleName
             DL.fail(m); notifyDone("Download failed", m)
         } finally {
             Prefs.removePending(this, url)
+            Dl.unqueue(url)
             val left = pending.decrementAndGet()
             DL.queue = left
             if (left == 0) {
@@ -109,26 +113,45 @@ class DownloadService : Service() {
         val q = Prefs.quality(this)
         val hd = vOnly != null && aud != null && (prog == null || vOnly.height > prog.height)
 
-        when {
-            q == 2 && aud != null -> saveSimple(aud.content, "$safe.m4a", "audio/mp4")
-            q == 0 && hd -> saveHd(vOnly!!.content, aud!!.content, "$safe.mp4")
-            prog != null -> saveSimple(prog.content, "$safe.mp4", "video/mp4")
+        val outName: String = when {
+            q == 2 && aud != null -> { saveSimple(aud.content, "$safe.m4a", "audio/mp4"); "$safe.m4a" }
+            q == 0 && hd -> { saveHd(vOnly!!.content, aud!!.content, "$safe.mp4"); "$safe.mp4" }
+            prog != null -> { saveSimple(prog.content, "$safe.mp4", "video/mp4"); "$safe.mp4" }
             else -> throw IOException("No downloadable stream found for this video")
         }
         DL.complete(info.name)
         Prefs.setLastDone(this, info.name)
+        History.markDownloaded(this, History.idOf(url), info.name, outName)      // remember it was downloaded
         runCatching { Backup.save(this) }
         notifyDone("Download complete", info.name)
     }
 
-    private fun saveSimple(url: String, name: String, mime: String) {
+    /** Facebook / Instagram: [media] is a direct link to the video file found on the web page. */
+    private fun processDirect(media: String, title: String) {
+        DL.begin(); DL.title = title
+        val safe = title.replace(Regex("[\\\\/:*?\"<>|\\p{Cntrl}]"), "_").trim().take(90).ifBlank { "video" }
+        val file = "$safe.mp4"
+        try {
+            saveSimple(media, file, "video/mp4")
+        } catch (e: IOException) {
+            // some servers refuse fast (parallel) download: use one plain connection instead
+            if (e.message?.contains("fast download") == true) saveSimple(media, file, "video/mp4", true) else throw e
+        }
+        DL.complete(title)
+        Prefs.setLastDone(this, title)
+        History.markDownloaded(this, "web:$safe", title, file)
+        runCatching { Backup.save(this) }
+        notifyDone("Download complete", title)
+    }
+
+    private fun saveSimple(url: String, name: String, mime: String, single: Boolean = false) {
         val out = Usb.open(this, name, mime)
         try {
             ParcelFileDescriptor.AutoCloseOutputStream(out.pfd).channel.use { ch ->
-                fetchTo(url, ch, 0, 100)
+                if (single) fetchSingle(url, ch) else fetchTo(url, ch, 0, 100)
                 runCatching { ch.force(false) }
             }
-            out.finish()
+            out.finish()    // success: in USB (MediaStore) mode this makes the video visible; other modes do nothing
         } catch (e: Exception) {
             runCatching { out.pfd.close() }; out.delete(); throw e
         }
@@ -143,11 +166,42 @@ class DownloadService : Service() {
             try {
                 mux(vf, af, out.pfd, 55, 100)
                 out.pfd.close()
-                out.finish()
+                out.finish()    // success: in USB (MediaStore) mode this makes the video visible; other modes do nothing
             } catch (e: Exception) {
                 runCatching { out.pfd.close() }; out.delete(); throw e
             }
         } finally { vf.delete(); af.delete() }
+    }
+
+    /** Plain one-connection download (used only when the server does not allow the fast parallel mode). */
+    private fun fetchSingle(url: String, ch: FileChannel) {
+        val req = okhttp3.Request.Builder().url(url).header("User-Agent", UA).build()
+        Http.dl.newCall(req).execute().use { r ->
+            if (!r.isSuccessful) throw IOException("Server error ${r.code}")
+            val body = r.body ?: throw IOException("Empty response")
+            val total = body.contentLength()
+            val ins = body.byteStream()
+            val buf = ByteArray(256 * 1024)
+            var done = 0L
+            var lastB = 0L
+            var lastT = SystemClock.elapsedRealtime()
+            while (true) {
+                val n = ins.read(buf)
+                if (n < 0) break
+                val bb = ByteBuffer.wrap(buf, 0, n)
+                while (bb.hasRemaining()) ch.write(bb)
+                done += n
+                Throttle.onBytes(this, n)
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastT >= 500) {
+                    DL.speed = (done - lastB) * 1000 / (now - lastT)
+                    lastB = done; lastT = now
+                    if (total > 0) DL.pct = (done * 100 / total).toInt().coerceAtMost(99)
+                    tickNotif()
+                }
+            }
+            DL.pct = 100
+        }
     }
 
     private fun probeSize(url: String): Long {

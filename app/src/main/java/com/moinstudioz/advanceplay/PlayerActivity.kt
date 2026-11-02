@@ -5,6 +5,8 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
@@ -43,6 +45,12 @@ class PlayerActivity : ComponentActivity() {
     private var player: ExoPlayer? = null
     private var key = ""
     private var yt: String? = null
+    private var fkey = ""                    // file name when playing from the Library (used for resume and "watched")
+    private var thumb = ""                   // YouTube thumbnail link (for the Watched list)
+    private var title = ""
+    private var resumeMs = 0L                // where a YouTube video continues from (0 = from the start)
+    private val saver = Handler(Looper.getMainLooper())
+    private val saveTick = object : Runnable { override fun run() { saveProgress(); saver.postDelayed(this, 15000) } }
     private lateinit var overlay: FrameLayout
     private lateinit var msg: TextView
 
@@ -55,7 +63,15 @@ class PlayerActivity : ComponentActivity() {
         yt = intent.getStringExtra("yt")
         key = intent.getStringExtra("uri") ?: ""
         val name = intent.getStringExtra("name") ?: ""
+        fkey = intent.getStringExtra("fkey") ?: ""
+        thumb = intent.getStringExtra("thumb") ?: ""
+        title = name
         if (yt == null && key.isEmpty()) { finish(); return }
+        if (yt != null && !intent.getBooleanExtra("fromStart", false)) {
+            // continue where we stopped last time (not when it was almost finished)
+            val w = History.progressOf(this, History.idOf(yt!!))
+            if (w != null && !w.finished && w.posMs > 5000) resumeMs = w.posMs
+        }
 
         val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         val view = PlayerView(this).apply { setBackgroundColor(Color.BLACK); isFocusable = true }
@@ -109,12 +125,15 @@ class PlayerActivity : ComponentActivity() {
         p.addListener(object : Player.Listener {
             override fun onPlayerError(e: PlaybackException) { say("Cannot play this video (${e.errorCodeName})") }
             override fun onPlaybackStateChanged(state: Int) { if (state == Player.STATE_READY) msg.visibility = View.GONE }
-            override fun onIsPlayingChanged(isPlaying: Boolean) { Throttle.streaming = isPlaying }
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                Throttle.streaming = isPlaying
+                if (isPlaying && yt != null) History.markWatched(this@PlayerActivity, History.idOf(yt!!))
+            }
         })
         if (yt != null) loadYoutube(yt!!)
         else {
             p.setMediaItem(MediaItem.Builder().setUri(Uri.parse(key)).setMediaMetadata(MediaMetadata.Builder().setTitle(name).build()).build())
-            val pos = Prefs.pos(this, key)
+            val pos = if (intent.getBooleanExtra("fromStart", false)) 0L else Prefs.pos(this, if (fkey.isNotEmpty()) fkey else key)
             if (pos > 0) p.seekTo(pos)
             p.prepare(); p.playWhenReady = true
         }
@@ -155,7 +174,9 @@ class PlayerActivity : ComponentActivity() {
                         prog != null -> p.setMediaSource(pf.createMediaSource(MediaItem.fromUri(prog.content)))
                         else -> { say("No playable stream found for this video"); return@runOnUiThread }
                     }
+                    if (!live && resumeMs > 0) p.seekTo(resumeMs)
                     p.prepare(); p.playWhenReady = true
+                    saver.postDelayed(saveTick, 15000)
                 }
             } catch (e: Exception) { say("Could not load this video: " + (e.message ?: "error")) }
         }.start()
@@ -176,10 +197,25 @@ class PlayerActivity : ComponentActivity() {
         return super.dispatchKeyEvent(e)
     }
 
+    /** YouTube: remember how far we watched (shown in the Watched list). */
+    private fun saveProgress() {
+        val u = yt ?: return
+        val p = player ?: return
+        if (p.isCurrentMediaItemLive || p.duration <= 0) return
+        History.saveProgress(this, History.idOf(u), title, thumb, p.currentPosition, p.duration)
+    }
+
     override fun onStop() {
         super.onStop()
+        saver.removeCallbacks(saveTick)
         player?.let {
-            if (yt == null && key.isNotEmpty()) Prefs.setPos(this, key, if (it.duration > 0 && it.currentPosition > it.duration - 5000) 0 else it.currentPosition)
+            if (yt == null && key.isNotEmpty()) {
+                val k = if (fkey.isNotEmpty()) fkey else key
+                val finished = it.duration > 0 && it.currentPosition > it.duration * 0.9
+                Prefs.setPos(this, k, if (it.duration > 0 && it.currentPosition > it.duration - 5000) 0 else it.currentPosition)
+                if (finished && fkey.isNotEmpty()) History.markWatched(this, "f:$fkey")
+            }
+            saveProgress()
             it.pause()
         }
         Throttle.streaming = false
