@@ -37,5 +37,7 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-hls:1.5.1")
     implementation("androidx.media3:media3-datasource:1.5.1")
     implementation("androidx.recyclerview:recyclerview:1.3.2")
+    implementation("dev.mobile:dadb:1.2.10")                  // lets the app send the "reboot" command to the TV itself (needs the TV's network debugging switch)
+    implementation("androidx.webkit:webkit:1.12.1")      // lets the web pages behave like a normal browser (sign-in pages)
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
 }
