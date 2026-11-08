@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="reboot_service_desc">Used only when you press \"Reboot the TV\" in Advance Play: it opens the TV\'s power menu and presses Restart. It does nothing else.</string>
+</resources>
