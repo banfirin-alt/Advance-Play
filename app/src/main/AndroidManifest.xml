@@ -55,6 +55,21 @@
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode"/>
         <activity android:name=".PlayerActivity" android:exported="false" android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode"/>
+        <activity android:name=".TransferActivity" android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode"/>
+        <activity android:name=".WatchedActivity" android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode"/>
+        <activity android:name=".WebAppActivity" android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode"/>
+        <!-- Restart helper: after it is switched on once in Accessibility, "Reboot the TV" opens the power menu and presses Restart -->
+        <service android:name=".RebootService" android:exported="true"
+            android:label="Advance Play - Restart helper"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService"/>
+            </intent-filter>
+            <meta-data android:name="android.accessibilityservice" android:resource="@xml/reboot_service"/>
+        </service>
         <service android:name=".DownloadService" android:exported="false" android:foregroundServiceType="dataSync"/>
     </application>
 </manifest>
