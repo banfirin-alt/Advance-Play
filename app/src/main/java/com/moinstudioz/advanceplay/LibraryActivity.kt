@@ -4,6 +4,7 @@ import android.app.AlertDialog
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
+import android.graphics.Outline
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
@@ -13,6 +14,7 @@ import android.text.TextUtils
 import android.text.format.Formatter
 import android.view.Gravity
 import android.view.View
+import android.view.ViewOutlineProvider
 import android.view.ViewGroup
 import android.widget.BaseAdapter
 import android.widget.FrameLayout
@@ -20,6 +22,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -38,6 +41,10 @@ class LibraryActivity : ComponentActivity() {
     private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density + .5f).toInt()
+    private fun clock(ms: Long): String {
+        val t = ms / 1000
+        return if (t >= 3600) String.format("%d:%02d:%02d", t / 3600, (t % 3600) / 60, t % 60) else String.format("%d:%02d", t / 60, t % 60)
+    }
     private fun shape(fill: Int, stroke: Int, w: Int) = GradientDrawable().apply {
         cornerRadius = dp(22).toFloat(); setColor(fill); setStroke(dp(w), stroke)
     }
@@ -58,24 +65,36 @@ class LibraryActivity : ComponentActivity() {
                 }
                 setOnClickListener {
                     startActivity(Intent(this@LibraryActivity, PlayerActivity::class.java)
-                        .putExtra("uri", v.uri.toString()).putExtra("name", v.name))
+                        .putExtra("uri", v.uri.toString()).putExtra("name", v.name).putExtra("fkey", v.name))
                 }
                 setOnLongClickListener { confirmDelete(v); true }
             }
-            val ic = ImageView(this@LibraryActivity).apply {
-                setImageResource(R.drawable.ic_play); imageTintList = ColorStateList.valueOf(Color.WHITE)
-                setPadding(dp(10), dp(10), dp(10), dp(10))
-                background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0xFF2A2A2A.toInt()) }
+            // picture of the video (a play symbol shows until the picture is ready, and for music)
+            val thumbBox = FrameLayout(this@LibraryActivity).apply {
+                setBackgroundColor(0xFF222222.toInt())
+                clipToOutline = true
+                outlineProvider = object : ViewOutlineProvider() {
+                    override fun getOutline(view: View, o: Outline) { o.setRoundRect(0, 0, view.width, view.height, dp(10).toFloat()) }
+                }
             }
-            row.addView(ic, dp(48), dp(48))
+            thumbBox.addView(ImageView(this@LibraryActivity).apply {
+                setImageResource(R.drawable.ic_play); imageTintList = ColorStateList.valueOf(Color.WHITE); alpha = 0.6f
+            }, FrameLayout.LayoutParams(dp(36), dp(36), Gravity.CENTER))
+            val thumb = ImageView(this@LibraryActivity).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+            thumbBox.addView(thumb, FrameLayout.LayoutParams(MATCH, MATCH))
+            LocalThumbs.load(this@LibraryActivity, v, thumb)
+            row.addView(thumbBox, dp(128), dp(72))
             val col = LinearLayout(this@LibraryActivity).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), 0, 0, 0) }
             col.addView(TextView(this@LibraryActivity).apply {
                 text = v.name.substringBeforeLast('.'); setTextColor(Color.WHITE); textSize = 16f
                 typeface = Typeface.DEFAULT_BOLD; maxLines = 2; ellipsize = TextUtils.TruncateAt.END
             })
             col.addView(TextView(this@LibraryActivity).apply {
+                val resume = Prefs.pos(this@LibraryActivity, v.name)
+                val tag = if (History.isWatched(this@LibraryActivity, "f:" + v.name)) "  \u00B7  \u2714 Watched"
+                          else if (resume > 5000) "  \u00B7  Resume " + clock(resume) else ""
                 text = Formatter.formatFileSize(this@LibraryActivity, v.size) + "  \u00B7  " +
-                    DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(v.modified))
+                    DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(v.modified)) + tag
                 setTextColor(0xFF9A9A9A.toInt()); textSize = 12f
             })
             row.addView(col, LinearLayout.LayoutParams(0, WRAP, 1f))
@@ -109,7 +128,7 @@ class LibraryActivity : ComponentActivity() {
         }
         root.addView(col, MATCH, MATCH)
         root.addView(empty, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.CENTER))
-        setContentView(root)
+        setContentView(root); Fx.install(this)
     }
 
     override fun onResume() { super.onResume(); reload() }
@@ -117,7 +136,10 @@ class LibraryActivity : ComponentActivity() {
     private fun reload() {
         Thread {
             val l = try { Library.list(this) } catch (e: Exception) { emptyList() }
+            // an empty Library explains what it can see, so that one photo shows what is wrong
+            val rep = if (l.isEmpty()) try { Library.report(this) } catch (e: Exception) { "Report failed: " + (e.message ?: "") } else ""
             runOnUiThread {
+                if (l.isEmpty()) empty.text = "No videos yet.\nDownloaded videos appear here.\n\n" + rep
                 items.clear(); items.addAll(l); adapter.notifyDataSetChanged()
                 val total = l.sumOf { it.size }
                 head.text = "Library  \u00B7  ${l.size} video" + (if (l.size == 1) "" else "s") +
@@ -127,16 +149,35 @@ class LibraryActivity : ComponentActivity() {
         }.start()
     }
 
-    private fun confirmDelete(it: Library.Item) {
-        AlertDialog.Builder(this).setTitle("Delete this video?").setMessage(it.name)
+    private fun confirmDelete(v: Library.Item) {
+        AlertDialog.Builder(this).setTitle("Delete this video?").setMessage(v.name)
             .setPositiveButton("Delete") { _, _ ->
                 Thread {
+                    val media = Prefs.media(this) != null      // USB drive (MediaStore) mode
+                    var problem: String? = null
                     try {
-                        if (it.uri.scheme == "file") File(it.uri.path!!).delete()
-                        else if (it.uri.authority == "media") contentResolver.delete(it.uri, null, null)
-                        else DocumentsContract.deleteDocument(contentResolver, it.uri)
-                    } catch (_: Exception) {}
-                    runOnUiThread { reload() }
+                        if (v.uri.scheme == "file") {
+                            // a file found in the folder: if the TV refuses a plain delete, ask MediaStore to remove it
+                            if (!File(v.uri.path!!).delete() && media && !Usb.mediaDeleteByName(this, v.name)) problem = "Could not delete this video"
+                        }
+                        else if (media) {
+                            // MediaStore mode: delete the row, Android deletes the file on the USB too
+                            // a video that is already gone from the drive is simply removed from the list
+                        contentResolver.delete(v.uri, null, null)
+                        }
+                        else DocumentsContract.deleteDocument(contentResolver, v.uri)
+                    } catch (e: SecurityException) {
+                        // includes RecoverableSecurityException: Android did not allow us to delete a file we did not create
+                        if (media) problem = "Android did not allow deleting this video"
+                    } catch (e: Exception) {
+                        if (media) problem = "Could not delete: " + (e.message ?: e.javaClass.simpleName).take(80)
+                    }
+                    if (problem == null) History.forgetFile(this, v.name)
+                    val msg: String? = problem
+                    runOnUiThread {
+                        if (msg != null) Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                        reload()
+                    }
                 }.start()
             }.setNegativeButton("Cancel", null).show()
     }

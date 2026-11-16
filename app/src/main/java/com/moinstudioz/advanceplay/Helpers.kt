@@ -1,5 +1,8 @@
 package com.moinstudioz.advanceplay
 
+import java.io.File
+import android.net.Uri
+import android.media.MediaMetadataRetriever
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -43,12 +46,101 @@ object Dl {
         if (!u.contains("youtube.com") && !u.contains("youtu.be")) null
         else rx.find(u)?.groupValues?.get(1)?.let { "https://www.youtube.com/watch?v=$it" }
 
-    /** Returns an error message, or null when the download was queued. */
+    /** Videos that are waiting or running right now (YouTube links and web-download keys), so the same video is not queued twice. */
+    private val queued = java.util.Collections.synchronizedSet(HashSet<String>())
+    /** Marks a video as queued. Returns false when it already was. */
+    fun markQueued(key: String): Boolean = queued.add(key)
+    fun unqueue(key: String) { queued.remove(key) }
+
+    /** Returns an error message, or null when the download was queued. The same video cannot be queued twice. */
     fun enqueue(c: Context, u: String): String? {
         val v = canonical(u) ?: return "That is not a video link"
         UsbState.err?.let { return it }
+        // already downloaded? Not again, unless the same button is pressed a second time within 8 seconds
+        val id = History.idOf(v)
+        if (History.isDownloaded(c, id)) {
+            val now = System.currentTimeMillis()
+            if (dupKey != id || now - dupAt > 8000) {
+                dupKey = id; dupAt = now
+                return "Already downloaded (see Library). Press Download again to get it once more."
+            }
+        }
+        if (!markQueued(v)) return "Already in the download queue"
         return try {
             ContextCompat.startForegroundService(c, Intent(c, DownloadService::class.java).putExtra("url", v)); null
-        } catch (e: Exception) { "Cannot start download: " + e.message }
+        } catch (e: Exception) { unqueue(v); "Cannot start download: " + e.message }
+    }
+
+    @Volatile private var dupKey = ""
+    @Volatile private var dupAt = 0L
+
+    /** Any site: download a stream playlist (.m3u8): the parts are downloaded in parallel and joined into one video file. */
+    fun enqueueHls(c: Context, key: String, m3u8: String, title: String, referer: String = ""): String? {
+        UsbState.err?.let { return it }
+        if (!markQueued(key)) return "Already in the download queue"
+        return try {
+            ContextCompat.startForegroundService(c, Intent(c, DownloadService::class.java)
+                .putExtra("url", key).putExtra("hls", m3u8).putExtra("name", title).putExtra("referer", referer)); null
+        } catch (e: Exception) { unqueue(key); "Cannot start download: " + e.message }
+    }
+
+    /** Facebook / Instagram: download a video file link found on a web page. [key] identifies the video (to block duplicates). */
+    fun enqueueDirect(c: Context, key: String, mediaUrl: String, title: String, audioUrl: String? = null, referer: String = ""): String? {
+        UsbState.err?.let { return it }
+        if (!markQueued(key)) return "Already in the download queue"
+        return try {
+            // audioUrl is set when the site keeps picture and sound in two files: they are downloaded and joined
+            ContextCompat.startForegroundService(c, Intent(c, DownloadService::class.java)
+                .putExtra("url", key).putExtra("direct", mediaUrl).putExtra("audio", audioUrl).putExtra("name", title)
+                .putExtra("referer", referer)); null
+        } catch (e: Exception) { unqueue(key); "Cannot start download: " + e.message }
+    }
+}
+
+/** The picture of a saved video (a frame from its start), made in the background and kept on the device, so the Library opens fast. */
+object LocalThumbs {
+    private val cache = object : LruCache<String, Bitmap>(12 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap) = value.byteCount
+    }
+    private val pool = Executors.newFixedThreadPool(2)
+
+    private fun fileFor(c: Context, key: String): File {
+        val dir = File(c.cacheDir, "libthumbs")
+        dir.mkdirs()
+        return File(dir, Integer.toHexString(key.hashCode()) + ".jpg")
+    }
+
+    fun load(c: Context, item: Library.Item, iv: ImageView) {
+        val key = item.name + "|" + item.size
+        iv.tag = key
+        iv.setImageDrawable(null)
+        cache.get(key)?.let { iv.setImageBitmap(it); return }
+        pool.execute {
+            try {
+                val f = fileFor(c, key)
+                var bmp: Bitmap? = if (f.exists() && f.length() > 0) BitmapFactory.decodeFile(f.path) else null
+                if (bmp == null) {
+                    bmp = frame(c, item.uri)
+                    val made = bmp
+                    if (made != null) try { java.io.FileOutputStream(f).use { made.compress(Bitmap.CompressFormat.JPEG, 80, it) } } catch (_: Exception) {}
+                }
+                val b = bmp ?: return@execute
+                cache.put(key, b)
+                iv.post { if (iv.tag == key) iv.setImageBitmap(b) }
+            } catch (_: Throwable) {}
+        }
+    }
+
+    private fun frame(c: Context, uri: Uri): Bitmap? {
+        val r = MediaMetadataRetriever()
+        try {
+            if (uri.scheme == "file") r.setDataSource(uri.path) else r.setDataSource(c, uri)
+            val dur = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            val at = if (dur > 20000) 5_000_000L else dur * 200          // 5 seconds in (or 20% of a short video), in microseconds
+            val raw = r.getFrameAtTime(at, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: return null
+            val w = 320
+            val h = (raw.height * (w.toFloat() / raw.width)).toInt().coerceAtLeast(1)
+            return Bitmap.createScaledBitmap(raw, w, h, true)
+        } catch (_: Throwable) { return null } finally { try { r.release() } catch (_: Throwable) {} }
     }
 }

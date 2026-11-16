@@ -12,6 +12,7 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }       // TVs and phones are ARM; keeps the app smaller
     }
     buildTypes { release { isMinifyEnabled = false } }
     compileOptions {
@@ -20,7 +21,11 @@ android {
         isCoreLibraryDesugaringEnabled = true
     }
     kotlinOptions { jvmTarget = "17" }
-    packaging { resources.excludes += setOf("META-INF/*.md", "META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*") }
+    packaging {
+        resources.excludes += setOf("META-INF/*.md", "META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*",
+            "META-INF/versions/**", "META-INF/INDEX.LIST", "META-INF/FastDoubleParser-*", "META-INF/io.netty.versions.properties")
+        jniLibs { useLegacyPackaging = true }          // the video extractor (yt-dlp) is unpacked from native files
+    }
 }
 
 dependencies {
@@ -37,5 +42,8 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-hls:1.5.1")
     implementation("androidx.media3:media3-datasource:1.5.1")
     implementation("androidx.recyclerview:recyclerview:1.3.2")
+    implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")   // yt-dlp inside the app: finds the video on hundreds of websites
+    implementation("com.google.zxing:core:3.5.3")             // draws the QR code on the "Send to TV" screen
+    implementation("androidx.webkit:webkit:1.12.1")      // lets the web pages behave like a normal browser (sign-in pages)
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
 }
